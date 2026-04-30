@@ -28,6 +28,10 @@ tar, registry pull, local-docker pull).
   - [`scribe scan`](#scribe-scan-umbrella)
   - [`scribe policy`](#scribe-policy)
   - [`scribe vulndb compile / update`](#scribe-vulndb)
+- [Populating the Advisory Database](#populating-the-advisory-database)
+  - OSV.dev per-ecosystem zips (PyPI, npm, Go, …)
+  - CISA KEV catalog
+  - NVD, generic recipes, refresh cadence
 - [Data Formats](#data-formats)
   - [SCVD binary advisory DB](#scvd-binary-advisory-db)
   - [Scribe OSV-lite JSON](#scribe-osv-lite-json)
@@ -229,13 +233,15 @@ exit=1
 ### `scribe vulndb`
 
 ```
-scribe vulndb compile <in.json> <out.scvd>
-scribe vulndb update --from <url> --out <out.scvd>
+scribe vulndb compile <in.json|-> <out.scvd>
+scribe vulndb update  --from <url> --out <out.scvd>
 ```
 
 `compile` accepts any DB shape `Database.load` can read (scribe OSV-lite,
 OSV native single, OSV native array, even an existing `.scvd`) and emits
 the compact mmap-friendly binary. Typical size: 3-5× smaller than JSON.
+Pass `-` as the input path to read JSON from stdin (handy with
+`curl | jq | scribe vulndb compile -`).
 
 `update` does HTTPS GET via `std.http.Client`, parses the response as
 above, and writes a `.scvd`. URL must serve advisory JSON in any
@@ -243,8 +249,181 @@ supported shape.
 
 ```bash
 scribe vulndb compile osv-lite.json osv.scvd
+scribe vulndb compile - osv.scvd <  ./osv-feed.json
 scribe vulndb update --from https://example.com/advisories.json --out osv.scvd
 ```
+
+> Zig 0.16's `std.http.Client` TLS implementation does not handle every
+> server. If `update` errors with `TlsInitializationFailed`, the binary
+> prints a `curl ... | scribe vulndb compile - ...` workaround. See
+> [Populating the Advisory Database](#populating-the-advisory-database)
+> below for ready-made recipes against OSV.dev's per-ecosystem feeds and
+> the CISA KEV catalog.
+
+---
+
+## Populating the Advisory Database
+
+scribe ships with **no built-in advisory data**. You bring your own. Three
+common feeds, plus a generic stdin recipe:
+
+### OSV.dev (per-ecosystem zips) — recommended
+
+OSV.dev publishes one zip per ecosystem at:
+
+```
+https://osv-vulnerabilities.storage.googleapis.com/<ecosystem>/all.zip
+```
+
+Each zip contains thousands of `*.json` files, each a single OSV native
+advisory. scribe's `parseOsv` handles the array form, so concatenate
+with `jq -s '.'` before piping into `compile -`.
+
+Common ecosystems (case-sensitive in the URL):
+
+| Ecosystem      | URL                                                                            |
+| -------------- | ------------------------------------------------------------------------------ |
+| PyPI           | `https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip`              |
+| npm            | `https://osv-vulnerabilities.storage.googleapis.com/npm/all.zip`               |
+| Go             | `https://osv-vulnerabilities.storage.googleapis.com/Go/all.zip`                |
+| RubyGems       | `https://osv-vulnerabilities.storage.googleapis.com/RubyGems/all.zip`          |
+| crates.io      | `https://osv-vulnerabilities.storage.googleapis.com/crates.io/all.zip`         |
+| Maven          | `https://osv-vulnerabilities.storage.googleapis.com/Maven/all.zip`             |
+| NuGet          | `https://osv-vulnerabilities.storage.googleapis.com/NuGet/all.zip`             |
+| Packagist      | `https://osv-vulnerabilities.storage.googleapis.com/Packagist/all.zip`         |
+| Hex            | `https://osv-vulnerabilities.storage.googleapis.com/Hex/all.zip`               |
+| Pub            | `https://osv-vulnerabilities.storage.googleapis.com/Pub/all.zip`               |
+| Debian         | `https://osv-vulnerabilities.storage.googleapis.com/Debian/all.zip`            |
+| Ubuntu         | `https://osv-vulnerabilities.storage.googleapis.com/Ubuntu/all.zip`            |
+| Alpine         | `https://osv-vulnerabilities.storage.googleapis.com/Alpine/all.zip`            |
+| Rocky Linux    | `https://osv-vulnerabilities.storage.googleapis.com/Rocky%20Linux/all.zip`     |
+| GitHub Actions | `https://osv-vulnerabilities.storage.googleapis.com/GitHub%20Actions/all.zip`  |
+
+Canonical ecosystem list at <https://osv.dev/data>. URLs containing
+spaces (`Rocky Linux`, `GitHub Actions`) must be percent-encoded.
+
+GHSA covers PyPI / npm / Go / RubyGems / crates.io / Maven / NuGet /
+Packagist / Pub / Hex / Erlang / Swift / GitHub Actions ecosystems —
+there is no single "GHSA bulk" URL; pick by language ecosystem.
+
+#### Single ecosystem
+
+```bash
+mkdir -p osv-pypi && cd osv-pypi
+curl -sSL "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip" -o all.zip
+unzip -q all.zip
+jq -s '.' *.json | scribe vulndb compile - ../osv-pypi.scvd
+cd .. && rm -rf osv-pypi
+```
+
+Rough sizes:
+
+| Ecosystem | Zip download | SCVD output | Advisory count (approx) |
+| --------- | ------------:| -----------:| -----------------------:|
+| Go        |       ~5 MB  |      ~2 MB  |              1 000      |
+| PyPI      |     ~20 MB   |      ~7 MB  |              7 000      |
+| npm       |     ~30 MB   |     ~10 MB  |             14 000      |
+| Debian    |     ~50 MB   |     ~20 MB  |             40 000      |
+
+#### Multiple ecosystems combined
+
+scribe doesn't yet have a `vulndb merge`, but `parseOsv` accepts arrays,
+so concatenate the JSON before piping:
+
+```bash
+mkdir -p osv-all
+for eco in PyPI npm Go RubyGems crates.io Maven; do
+  curl -sSL "https://osv-vulnerabilities.storage.googleapis.com/$eco/all.zip" \
+    -o "osv-all/$eco.zip"
+  unzip -q "osv-all/$eco.zip" -d "osv-all/$eco"
+done
+jq -s '.' osv-all/*/*.json | scribe vulndb compile - osv-all.scvd
+rm -rf osv-all
+```
+
+Combined SCVD: ~50-100 MB depending on ecosystem coverage. One mmap'd
+load matches against any binary regardless of language.
+
+> **Memory tip.** `jq -s '.' *.json` keeps the full array in RAM. For
+> Debian / Ubuntu (40k+ records) plan for 200-500 MB peak. If RAM-tight,
+> chunk the input or shard the SCVDs and run `scribe vulns` against each.
+
+### CISA KEV catalog
+
+The CISA Known Exploited Vulnerabilities feed uses its own shape — neither
+scribe OSV-lite nor OSV native. Convert with `jq` first:
+
+```bash
+curl -sSL "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json" \
+  | jq '{
+      version: 1,
+      advisories: [.vulnerabilities[] | {
+        id: .cveID,
+        summary: .vulnerabilityName,
+        severity: "high",
+        package: (.product | ascii_downcase),
+        ranges: [],
+        references: ["https://nvd.nist.gov/vuln/detail/\(.cveID)"]
+      }]
+    }' \
+  | scribe vulndb compile - cisa-kev.scvd
+```
+
+KEV doesn't track version ranges — every CVE matches the named product
+across all versions (empty `ranges`). KEV severity is implicit ("actively
+exploited") so we map everything to `high`. Pair KEV with OSV.dev for
+breadth — scribe matches against the first DB it's pointed at, so keep
+them as separate `.scvd` files and call `scribe vulns` once per DB.
+
+### NVD (CVE JSON 2.0)
+
+NVD publishes per-year JSON archives at
+`https://nvd.nist.gov/vuln/data-feeds`. The schema is verbose; the
+shortest path to scribe is to convert NVD CVE Items to OSV-lite via `jq`,
+treating each `cve.id` as the advisory id, `descriptions[].value` as
+summary, and `cpeMatch` entries as ranges. Recipe is fiddly enough to
+warrant a dedicated tool — out of scope here. If you only need critical
+exploited CVEs, use CISA KEV instead.
+
+### Generic recipe — anything that emits JSON
+
+Anything you can `curl` and shape with `jq` to scribe OSV-lite or OSV
+native works:
+
+```bash
+curl -sSL <url> | jq '<transform>' | scribe vulndb compile - out.scvd
+```
+
+scribe's `parseJson` (OSV-lite) accepts the simplest shape:
+
+```json
+{
+  "version": 1,
+  "advisories": [
+    { "id": "...", "summary": "...", "severity": "high",
+      "package": "openssl",
+      "ranges": [{"introduced": "0", "fixed": "3.0.8"}],
+      "references": ["https://..."] }
+  ]
+}
+```
+
+If your transform produces this, you're done. Match-time package
+normalization (alias map: `libcrypto.so.3` → `openssl`, `libc.musl-*` →
+`musl`, etc.) is automatic — emit canonical package names in the DB.
+
+### Refresh cadence
+
+- **OSV.dev / GHSA:** updated continuously. Daily `cron` rebuild is fine
+  for CI; weekly for personal use. Drop the rebuild script in a Makefile
+  target.
+- **CISA KEV:** updated weekly. Refresh the `.scvd` weekly to catch
+  newly-exploited CVEs.
+- **NVD:** the JSON 2.0 modified feed updates every 2 hours, but most
+  scribe users won't need to re-pull that often.
+
+A typical CI pipeline pulls + compiles in <30 s for PyPI+npm+Go combined
+(~30 MB total download).
 
 ---
 

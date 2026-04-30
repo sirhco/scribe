@@ -1238,24 +1238,66 @@ fn runVulndbCompile(
     in_path: []const u8,
     out_path: []const u8,
 ) !void {
-    var in_map = try scribe.mmap.open(io, in_path);
-    defer in_map.deinit();
+    // Special-case: `-` reads JSON from stdin. Useful for piping past
+    // scribe's TLS issues (e.g. `curl <url> | scribe vulndb compile - out.scvd`).
+    var stdin_owned: ?[]u8 = null;
+    defer if (stdin_owned) |b| gpa.free(b);
 
-    // load() auto-detects scribe-lite JSON, OSV native JSON (single or
-    // array), or already-compiled SCVD binary.
-    var db = try scribe.security.vulnerability.load(gpa, in_map.bytes());
+    if (!std.mem.eql(u8, in_path, "-")) {
+        // File path: mmap and parse in place.
+        var in_map = try scribe.mmap.open(io, in_path);
+        defer in_map.deinit();
+        var db_local = try scribe.security.vulnerability.load(gpa, in_map.bytes());
+        defer db_local.deinit(gpa);
+
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        try scribe.security.vulnerability.writeBinary(db_local, &aw.writer);
+        const bytes = aw.written();
+
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = bytes });
+        try out.print(
+            "compiled {d} advisories  ->  {s}  ({d} bytes)\n",
+            .{ db_local.advisories.len, out_path, bytes.len },
+        );
+        return;
+    }
+
+    // Stdin path: drain everything into a buffer.
+    var stdin_buf: [16 * 1024]u8 = undefined;
+    var sin: Io.File.Reader = .init(.stdin(), io, &stdin_buf);
+    var aw_in: std.Io.Writer.Allocating = .init(gpa);
+    defer aw_in.deinit();
+    _ = sin.interface.streamRemaining(&aw_in.writer) catch |err| {
+        try out.print("error: failed to read stdin: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const owned = try aw_in.toOwnedSlice();
+    stdin_owned = owned;
+    const json_bytes: []const u8 = owned;
+
+    // Stdin path: parse json_bytes (owned), write binary, write file.
+    var db = scribe.security.vulnerability.load(gpa, json_bytes) catch |err| {
+        try out.print("error: advisory JSON parse failed: {s}\n", .{@errorName(err)});
+        try out.writeAll(
+            \\(scribe accepts: scribe OSV-lite, OSV.dev native, or .scvd binary.
+            \\ The CISA KEV catalog uses a different shape and needs jq conversion;
+            \\ see SECURITY.md for the recipe.)
+            \\
+        );
+        return err;
+    };
     defer db.deinit(gpa);
 
-    var aw: std.Io.Writer.Allocating = .init(gpa);
-    defer aw.deinit();
-    try scribe.security.vulnerability.writeBinary(db, &aw.writer);
-    const bytes = aw.written();
+    var aw2: std.Io.Writer.Allocating = .init(gpa);
+    defer aw2.deinit();
+    try scribe.security.vulnerability.writeBinary(db, &aw2.writer);
+    const out_bytes = aw2.written();
 
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = bytes });
-
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = out_bytes });
     try out.print(
         "compiled {d} advisories  ->  {s}  ({d} bytes)\n",
-        .{ db.advisories.len, out_path, bytes.len },
+        .{ db.advisories.len, out_path, out_bytes.len },
     );
 }
 
@@ -1280,6 +1322,19 @@ fn runVulndbUpdate(
         },
     }) catch |err| {
         try out.print("error: HTTP fetch failed: {s}\n", .{@errorName(err)});
+        // Zig 0.16's std.http.Client TLS impl doesn't handle every server
+        // out there (some cipher suites, ECH, oddball cert chains). Always
+        // print a curl-based fallback so users have a path forward.
+        try out.print(
+            \\
+            \\workaround — fetch externally and pipe in:
+            \\  curl -sSL "{s}" | scribe vulndb compile - {s}
+            \\
+            \\
+        ,
+            .{ url, out_path },
+        );
+        out.flush() catch {};
         return err;
     };
     if (result.status != .ok) {

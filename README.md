@@ -330,10 +330,35 @@ All security signals merge into a single CycloneDX 1.5 SBOM with
 `registry://`, `docker://`) auto-discover embedded Dockerfiles / YAMLs
 and audit the OCI image config blob.
 
+#### Populating the advisory DB
+
+scribe ships with no built-in advisory data. Pull from OSV.dev's
+per-ecosystem zips, the CISA KEV catalog, or any feed you can `curl + jq`
+into scribe's OSV-lite shape. Quick PyPI example:
+
+```bash
+mkdir osv && cd osv
+curl -sSL "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip" -o all.zip
+unzip -q all.zip
+jq -s '.' *.json | scribe vulndb compile - ../osv-pypi.scvd
+cd .. && rm -rf osv
+scribe vulns ./myapp --db osv-pypi.scvd
+```
+
+OSV bulk URL pattern: `https://osv-vulnerabilities.storage.googleapis.com/<ecosystem>/all.zip`
+(ecosystems: `PyPI`, `npm`, `Go`, `RubyGems`, `crates.io`, `Maven`,
+`NuGet`, `Packagist`, `Hex`, `Pub`, `Debian`, `Ubuntu`, `Alpine`, …).
+Full list at <https://osv.dev/data>.
+
+`scribe vulndb compile` also accepts `-` to read JSON from stdin —
+useful as a TLS escape hatch when `scribe vulndb update` chokes on a
+server's cert chain (Zig 0.16's `std.http.Client` has known TLS gaps).
+
 See [**SECURITY.md**](SECURITY.md) for: subcommand reference, JSON
 formats (OSV-lite, OSV native, SCVD binary spec, policy.json), full
 rule catalog (`DKR###`, `K8S###`, `OCI###`), the secret pattern table,
-performance notes, and CI integration examples.
+**ready-made recipes for OSV / CISA KEV / NVD ingestion**, performance
+notes, and CI integration examples.
 
 ---
 
