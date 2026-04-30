@@ -18,14 +18,21 @@ const json = std.json;
 const errors = @import("errors.zig");
 const sbom_mod = @import("sbom.zig");
 const format = @import("format.zig");
+const security_config = @import("security/config.zig");
 
 pub const ImageSbom = struct {
     components: []sbom_mod.Component,
+    /// IaC misconfigurations from embedded Dockerfiles / *.yaml / *.yml in the
+    /// squashed image. Empty when no such files are encountered.
+    config_issues: []security_config.Issue = &.{},
 
     pub fn deinit(self: *ImageSbom, allocator: std.mem.Allocator) void {
         for (self.components) |c| sbom_mod.freeComponent(allocator, c);
         allocator.free(self.components);
+        for (self.config_issues) |it| security_config.freeIssue(allocator, it);
+        if (self.config_issues.len != 0) allocator.free(self.config_issues);
         self.components = &.{};
+        self.config_issues = &.{};
     }
 };
 
@@ -72,9 +79,12 @@ pub fn collectFromBlobs(
     defer parsed.deinit();
 
     var components: std.ArrayList(sbom_mod.Component) = .empty;
+    var config_issues: std.ArrayList(security_config.Issue) = .empty;
     errdefer {
         for (components.items) |c| sbom_mod.freeComponent(allocator, c);
         components.deinit(allocator);
+        for (config_issues.items) |it| security_config.freeIssue(allocator, it);
+        config_issues.deinit(allocator);
     }
 
     for (parsed.value) |entry| {
@@ -91,25 +101,53 @@ pub fn collectFromBlobs(
         while (it.next()) |kv| {
             const file_path = kv.key_ptr.*;
             const file_bytes = kv.value_ptr.*;
-            if (!isExecutableMagic(file_bytes)) continue;
 
-            const sub = sbom_mod.collect(allocator, file_bytes) catch continue;
-            for (sub.components) |c| {
-                const c2: sbom_mod.Component = .{
-                    .kind = c.kind,
-                    .name = c.name,
-                    .version = c.version,
-                    .evidence = c.evidence,
-                    .path = allocator.dupe(u8, file_path) catch null,
-                    .platform = allocator.dupe(u8, platform_tag) catch null,
-                };
-                components.append(allocator, c2) catch return error.OutOfMemory;
+            if (isExecutableMagic(file_bytes)) {
+                const sub = sbom_mod.collect(allocator, file_bytes) catch continue;
+                for (sub.components) |c| {
+                    const c2: sbom_mod.Component = .{
+                        .kind = c.kind,
+                        .name = c.name,
+                        .version = c.version,
+                        .evidence = c.evidence,
+                        .path = allocator.dupe(u8, file_path) catch null,
+                        .platform = allocator.dupe(u8, platform_tag) catch null,
+                    };
+                    components.append(allocator, c2) catch return error.OutOfMemory;
+                }
+                allocator.free(sub.components);
+                continue;
             }
-            allocator.free(sub.components);
+
+            // Text-eligible files: run the IaC config audit. Only common
+            // extensions/basenames so we don't try to audit random text blobs.
+            if (isConfigEligible(file_path)) {
+                var issues = security_config.detectAndAudit(allocator, file_bytes, file_path) catch continue;
+                for (issues.items) |is| {
+                    config_issues.append(allocator, is) catch return error.OutOfMemory;
+                }
+                if (issues.items.len != 0) allocator.free(issues.items);
+                issues.items = &.{};
+            }
         }
     }
 
-    return .{ .components = components.toOwnedSlice(allocator) catch return error.OutOfMemory };
+    return .{
+        .components = components.toOwnedSlice(allocator) catch return error.OutOfMemory,
+        .config_issues = config_issues.toOwnedSlice(allocator) catch return error.OutOfMemory,
+    };
+}
+
+fn isConfigEligible(path: []const u8) bool {
+    const base = std.fs.path.basename(path);
+    if (std.mem.eql(u8, base, "Dockerfile") or
+        std.mem.eql(u8, base, "Containerfile") or
+        std.mem.startsWith(u8, base, "Dockerfile.") or
+        std.mem.startsWith(u8, base, "Containerfile.") or
+        std.mem.endsWith(u8, base, ".Dockerfile") or
+        std.mem.endsWith(u8, base, ".Containerfile")) return true;
+    if (std.mem.endsWith(u8, base, ".yaml") or std.mem.endsWith(u8, base, ".yml")) return true;
+    return false;
 }
 
 const ManifestEntry = struct {

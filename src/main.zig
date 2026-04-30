@@ -429,14 +429,14 @@ fn runSbom(
     if (std.mem.startsWith(u8, path, "registry://")) {
         var bom = try scribe.registry.pullSbom(gpa, io, path, .{});
         defer bom.deinit(gpa);
-        try emitSbom(out, .{ .components = bom.components }, plain);
+        try emitSbom(out, .{ .components = bom.components, .config_issues = bom.config_issues }, plain);
         return;
     }
 
     if (scribe.local_docker.isLocalDockerUri(path)) {
         var bom = try scribe.local_docker.pullSbom(gpa, io, path);
         defer bom.deinit(gpa);
-        try emitSbom(out, .{ .components = bom.components }, plain);
+        try emitSbom(out, .{ .components = bom.components, .config_issues = bom.config_issues }, plain);
         return;
     }
 
@@ -447,7 +447,7 @@ fn runSbom(
     if (scribe.container.isContainer(bytes)) {
         var bom = try scribe.container.collect(gpa, bytes);
         defer bom.deinit(gpa);
-        try emitSbom(out, .{ .components = bom.components }, plain);
+        try emitSbom(out, .{ .components = bom.components, .config_issues = bom.config_issues }, plain);
     } else {
         var bom = try scribe.sbom.collect(gpa, bytes);
         defer bom.deinit(gpa);
@@ -773,7 +773,18 @@ fn runScan(
     defer target.deinit();
     const bytes = target.bytes();
 
-    var bom = try scribe.sbom.collect(gpa, bytes);
+    // Detect container vs binary target. Container path also auto-runs IaC
+    // audit on embedded Dockerfiles / *.yaml / *.yml from the squashed layers.
+    var bom: scribe.sbom.Sbom = if (scribe.container.isContainer(bytes)) blk: {
+        var img = try scribe.container.collect(gpa, bytes);
+        const s: scribe.sbom.Sbom = .{
+            .components = img.components,
+            .config_issues = img.config_issues,
+        };
+        img.components = &.{};
+        img.config_issues = &.{};
+        break :blk s;
+    } else try scribe.sbom.collect(gpa, bytes);
     defer bom.deinit(gpa);
 
     var findings = try scribe.security.secrets.scan(gpa, bytes, sec_opts);
@@ -796,12 +807,24 @@ fn runScan(
         vulns.items = &.{};
     }
 
+    // Explicit --config <path> appends issues alongside any auto-discovered
+    // ones from the container layers.
     if (config_path) |cp| {
         var cfg_map = try scribe.mmap.open(io, cp);
         defer cfg_map.deinit();
         var issues = try scribe.security.config.audit(gpa, cfg_map.bytes(), cp, .auto);
-        bom.config_issues = issues.items;
-        issues.items = &.{};
+        if (bom.config_issues.len == 0) {
+            bom.config_issues = issues.items;
+            issues.items = &.{};
+        } else {
+            const merged = try gpa.alloc(scribe.security.config.Issue, bom.config_issues.len + issues.items.len);
+            @memcpy(merged[0..bom.config_issues.len], bom.config_issues);
+            @memcpy(merged[bom.config_issues.len..], issues.items);
+            gpa.free(bom.config_issues);
+            gpa.free(issues.items);
+            bom.config_issues = merged;
+            issues.items = &.{};
+        }
     }
 
     if (plain) {
@@ -940,7 +963,16 @@ fn runPolicy(
     defer target.deinit();
     const bytes = target.bytes();
 
-    var bom = try scribe.sbom.collect(gpa, bytes);
+    var bom: scribe.sbom.Sbom = if (scribe.container.isContainer(bytes)) blk: {
+        var img = try scribe.container.collect(gpa, bytes);
+        const s: scribe.sbom.Sbom = .{
+            .components = img.components,
+            .config_issues = img.config_issues,
+        };
+        img.components = &.{};
+        img.config_issues = &.{};
+        break :blk s;
+    } else try scribe.sbom.collect(gpa, bytes);
     defer bom.deinit(gpa);
 
     var findings = try scribe.security.secrets.scan(gpa, bytes, sec_opts);
@@ -964,8 +996,18 @@ fn runPolicy(
         var cfg_map = try scribe.mmap.open(io, cp);
         defer cfg_map.deinit();
         var issues = try scribe.security.config.audit(gpa, cfg_map.bytes(), cp, .auto);
-        bom.config_issues = issues.items;
-        issues.items = &.{};
+        if (bom.config_issues.len == 0) {
+            bom.config_issues = issues.items;
+            issues.items = &.{};
+        } else {
+            const merged = try gpa.alloc(scribe.security.config.Issue, bom.config_issues.len + issues.items.len);
+            @memcpy(merged[0..bom.config_issues.len], bom.config_issues);
+            @memcpy(merged[bom.config_issues.len..], issues.items);
+            gpa.free(bom.config_issues);
+            gpa.free(issues.items);
+            bom.config_issues = merged;
+            issues.items = &.{};
+        }
     }
 
     var result = try scribe.security.policy.evaluate(gpa, policy, bom);
@@ -1021,7 +1063,9 @@ fn runVulndbCompile(
     var in_map = try scribe.mmap.open(io, in_path);
     defer in_map.deinit();
 
-    var db = try scribe.security.vulnerability.Database.parseJson(gpa, in_map.bytes());
+    // load() auto-detects scribe-lite JSON, OSV native JSON (single or
+    // array), or already-compiled SCVD binary.
+    var db = try scribe.security.vulnerability.load(gpa, in_map.bytes());
     defer db.deinit(gpa);
 
     var aw: std.Io.Writer.Allocating = .init(gpa);
@@ -1066,7 +1110,7 @@ fn runVulndbUpdate(
     }
 
     const json_bytes = body.writer.buffered();
-    var db = scribe.security.vulnerability.Database.parseJson(gpa, json_bytes) catch |err| {
+    var db = scribe.security.vulnerability.load(gpa, json_bytes) catch |err| {
         try out.print("error: advisory JSON parse failed: {s}\n", .{@errorName(err)});
         return err;
     };
