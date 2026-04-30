@@ -47,7 +47,7 @@ Scribe is the static analysis foundation for [Scribe Live](../scribe-live), the 
 | 5c    | Security: IaC audit (Dockerfile + Kubernetes + OCI image-config)   | done  |
 | 5d    | Security: policy gate, fingerprint cross-ref, `scribe scan` umbrella | done  |
 
-Tests: 120 unit + integration tests (`zig build test`).
+Tests: 125 unit + integration tests (`zig build test`).
 
 ---
 
@@ -250,7 +250,7 @@ $ scribe symbols ./myapp | head -5
 (5185 symbols)
 ```
 
-Mach-O `.dSYM` and PE `.pdb` are not yet supported (Phase-4 follow-on).
+Mach-O `.dSYM` and PE `.pdb` are not yet supported (Phase-4b/4c — see [Roadmap](#roadmap)).
 
 ### `scribe addr2line <path> <hex>`
 
@@ -316,13 +316,21 @@ management:
 
 ```bash
 scribe secrets ./myapp                                 # SIMD anchored + UTF-16LE secret scan
-scribe vulns   ./myapp --db osv.scvd                   # CVE matcher
+scribe vulns   ./myapp --db osv.scvd                   # CVE matcher (binary)
+scribe vulns   alpine.tar --db osv.scvd                # CVE matcher (container tar)
+scribe vulns   'registry://alpine:3.19' --db osv.scvd  # CVE matcher (direct registry pull)
 scribe config  ./Dockerfile                            # IaC misconfig audit (Dockerfile / k8s / OCI image-config)
 scribe scan    ./myapp --db osv.scvd --config Dockerfile --fp-db corpus.json   # full pipeline
 scribe policy  ./myapp --policy ci.json --db osv.scvd  # exits 1 on violation; CI-friendly
 scribe vulndb  compile osv-lite.json osv.scvd          # JSON → mmap binary
 scribe vulndb  update  --from <url> --out osv.scvd     # HTTPS fetch + compile
 ```
+
+`vulns`, `scan`, `policy`, and `sbom` all share the same source detection
+— pass a binary path, a `docker save` tar, a `docker://` URI, or a
+`registry://` URI to any of them. Container sources auto-discover every
+bundled binary, embedded Dockerfile / `*.yaml`, and OCI image-config
+hygiene problems in one pass.
 
 All security signals merge into a single CycloneDX 1.5 SBOM with
 `components[]`, `properties[]` (secrets + IaC findings), and
@@ -495,7 +503,7 @@ Registry source:
 | Entropy            | ✓   | ✓      | ✓   |
 | Fingerprint corpus | ✓   | —      | —   |
 
-Extensions to Mach-O `.dSYM` and PE `.pdb` are tracked under Phase-5.
+Extensions to Mach-O `.dSYM` and PE `.pdb` are tracked under Phase-4b/4c — see [Roadmap](#roadmap).
 
 ---
 
@@ -546,7 +554,7 @@ Cross-cutting modules: `mmap.zig` (RAII file mapping), `errors.zig` (unified err
 - **Fingerprint robustness**: function bytes are hashed verbatim. PIC
   relocations and link-time addresses cause the same source built with
   different base addresses or against different glibc versions to hash
-  differently. Phase-3b-extended will introduce relocation normalization.
+  differently. Phase-3b-ext will introduce relocation normalization.
 - **Registry redirect bug**: Zig 0.16.0's `std.http.Client` accepts
   `privileged_headers` but never writes them to the wire. Scribe uses a
   manual redirect path that drops `Authorization` on cross-domain hops to
@@ -560,13 +568,26 @@ Cross-cutting modules: `mmap.zig` (RAII file mapping), `errors.zig` (unified err
 
 ## Roadmap
 
-Items shipped here cover Phase 1 through Phase 4a. Open work:
+Shipped: Phases 1 through 5d (forensics core + full security pipeline).
+Open work, by phase:
 
-- **Phase-3b-ext** — relocation-normalized fingerprints.
-- **Phase-4b** — Mach-O `.dSYM` symbolication.
-- **Phase-4c** — PE PDB parsing.
-- **Phase-5** — function-flow CFG construction, anti-tampering checks,
-  yara-style rule integration.
+| Phase   | Item                                                                                  |
+| ------- | ------------------------------------------------------------------------------------- |
+| 3b-ext  | Relocation-normalized fingerprints (PIC GOT/PLT immediates hashed structurally so the same source built against different glibc / base addresses produces the same hash). |
+| 3b-ext  | Sliding-window function detection so stripped binaries (no DWARF / symtab) can match a fingerprint corpus. Today the `fp match` path requires symbol bounds on the target. |
+| 3c-ext  | Stream-mode `docker save` ingestion — current code buffers the full save tar (2 GiB cap) before walking. Streaming would lift the cap and reduce peak RSS on multi-GB images. |
+| 4b      | Mach-O `.dSYM` symbolication (parse the bundle's DWARF, hand off to existing dwarf.zig).|
+| 4c      | PE PDB parsing — scribe already extracts the PDB GUID from the debug directory, but std.zig has no PDB parser, so address → source line lookup is unavailable on PE. |
+| 5e      | `scribe vulndb merge` to combine multiple `.scvd` files in one pass (today: concat JSON + recompile). |
+| 5e      | Full YAML parser for the IaC config audit — current text-pattern scanner doesn't handle anchors, aliases, or Helm-templated manifests. |
+| 5e      | Native NVD CVE JSON 2.0 ingest (today via jq transform — see SECURITY.md). |
+| 5e      | CVSS v2 vector parser (v3.0/v3.1 already supported). |
+| 6       | Function-flow CFG construction, anti-tampering checks, yara-style rule integration.   |
+
+The Phase-5e items are quality-of-life follow-ons to the security
+pipeline; the core feature set is complete. Phase 6 is the next major
+direction (deeper static analysis, dynamic-pairing primitives for
+`scribe-live`).
 
 `scribe-live`, the dynamic execution observer, lives in the sibling
 [../scribe-live](../scribe-live) repo and depends on this library for

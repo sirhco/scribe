@@ -716,15 +716,50 @@ fn runVulns(
     json: bool,
     style: scribe.term.Style,
 ) !void {
-    var target = try scribe.mmap.open(io, target_path);
-    defer target.deinit();
     var db_map = try scribe.mmap.open(io, db_path);
     defer db_map.deinit();
-
     var db = try scribe.security.vulnerability.load(gpa, db_map.bytes());
     defer db.deinit(gpa);
 
-    var bom = try scribe.sbom.collect(gpa, target.bytes());
+    // Build an Sbom from the target. Same source-detection as `runSbom` /
+    // `runScan` so vuln matching works against binaries, container tars,
+    // local docker images, and direct registry pulls.
+    var bom: scribe.sbom.Sbom = blk: {
+        if (std.mem.startsWith(u8, target_path, "registry://")) {
+            var img = try scribe.registry.pullSbom(gpa, io, target_path, .{});
+            const s: scribe.sbom.Sbom = .{
+                .components = img.components,
+                .config_issues = img.config_issues,
+            };
+            img.components = &.{};
+            img.config_issues = &.{};
+            break :blk s;
+        }
+        if (scribe.local_docker.isLocalDockerUri(target_path)) {
+            var img = try scribe.local_docker.pullSbom(gpa, io, target_path);
+            const s: scribe.sbom.Sbom = .{
+                .components = img.components,
+                .config_issues = img.config_issues,
+            };
+            img.components = &.{};
+            img.config_issues = &.{};
+            break :blk s;
+        }
+        var target = try scribe.mmap.open(io, target_path);
+        defer target.deinit();
+        const bytes = target.bytes();
+        if (scribe.container.isContainer(bytes)) {
+            var img = try scribe.container.collect(gpa, bytes);
+            const s: scribe.sbom.Sbom = .{
+                .components = img.components,
+                .config_issues = img.config_issues,
+            };
+            img.components = &.{};
+            img.config_issues = &.{};
+            break :blk s;
+        }
+        break :blk try scribe.sbom.collect(gpa, bytes);
+    };
     defer bom.deinit(gpa);
 
     const refs = try gpa.alloc(scribe.security.vulnerability.ComponentRef, bom.components.len);

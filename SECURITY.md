@@ -6,7 +6,7 @@ Scribe's binary forensics primitives. Five integrated modules:
 | Module                 | What it does                                                                              |
 | ---------------------- | ----------------------------------------------------------------------------------------- |
 | `security.secrets`     | SIMD-accelerated secret scanner: anchored patterns + UTF-16LE pass + opt-in entropy filter |
-| `security.vulnerability` | CVE / advisory matcher with JSON (OSV-lite, OSV native) and binary mmap'd DBs             |
+| `security.vulnerability` | CVE / advisory matcher (binaries, container tars, OCI registry, local docker). Alias-aware dedup. JSON (OSV-lite, OSV native) + binary mmap'd `.scvd` DBs |
 | `security.config`      | IaC misconfiguration audit for Dockerfiles, Kubernetes manifests, OCI image-config blobs   |
 | `security.policy`      | Gatekeeper that evaluates SBOMs against JSON-defined fail conditions                       |
 | `fingerprint` (cross-ref) | Bridges Wyhash function-byte fingerprints into the vuln matcher for stripped binaries  |
@@ -84,6 +84,11 @@ scribe config ./pod.yaml
 # Match a binary against a CVE database
 scribe vulns ./myapp --db osv-lite.json
 
+# Same matcher, but against a container tar / registry / docker daemon
+scribe vulns alpine.tar --db osv.scvd
+scribe vulns 'registry://alpine:3.19@linux/amd64' --db osv.scvd
+scribe vulns 'docker://my-org/svc:dev' --db osv.scvd
+
 # Run the full pipeline (SBOM + secrets + vulns + IaC + fingerprint cross-ref)
 scribe scan ./myapp --db osv-lite.json --config ./Dockerfile --fp-db ./openssl-corpus.json
 
@@ -148,11 +153,22 @@ pem_private_key         off=0x000000a3  conf=100  ----…---- (len=113, H=4.66)
 ### `scribe vulns`
 
 ```
-scribe vulns <path> --db <p> [--json]
+scribe vulns <source> --db <p> [--json]
 ```
 
-Builds an SBOM from the target binary, then matches each component
-against the advisory database. `<p>` may be:
+Builds an SBOM from `<source>`, then matches each component against the
+advisory database. `<source>` accepts the **same shapes as `scribe sbom`
+and `scribe scan`** — same source-detection logic across all three
+subcommands:
+
+| Source                              | Pipeline                                       |
+| ----------------------------------- | ---------------------------------------------- |
+| local binary (ELF / Mach-O / PE)    | `sbom.collect`                                 |
+| `docker save` tarball               | `container.collect` (squash → per-binary scan) |
+| `docker://image[:tag]`              | `local_docker.pullSbom` (spawns `docker save`) |
+| `registry://[host/]name:tag[@os/arch]` | `registry.pullSbom` (HTTPS OCI V2)          |
+
+`<p>` may be:
 
 - A scribe OSV-lite JSON file
 - An OSV.dev native JSON file (single object or array)
@@ -165,6 +181,31 @@ OSV native).
 CVE-2018-FAKE       glibc@2.28  [high] cvss=7.5 fixed=2.30
   synthetic glibc 2.28 issue
 (1 vulnerabilities)
+```
+
+**Dedup.** Container scans produce one `Component` per binary that links a
+given shared library — for alpine that means ~15 evidence rows for musl,
+each linking `libc.musl-aarch64.so.1`. The matcher post-passes results
+through an alias-aware dedup keyed on
+`(advisory_id, normalizePackageName(package), matched_version)`, so each
+unique CVE appears once. Different versions of the same package are
+preserved (e.g. an image carrying both openssl 1.1.1k and openssl 3.0.7
+will surface both matches).
+
+Examples:
+
+```bash
+# Local binary
+scribe vulns ./myapp --db osv.scvd
+
+# Container tar (auto-discovers all bundled binaries + version strings)
+scribe vulns alpine.tar --db osv.scvd
+
+# Direct registry pull, no docker daemon required
+scribe vulns 'registry://alpine:3.19@linux/amd64' --db osv.scvd
+
+# Local docker daemon (works for never-pushed local builds)
+scribe vulns 'docker://my-org/svc:dev' --db osv.scvd
 ```
 
 ### `scribe config`
