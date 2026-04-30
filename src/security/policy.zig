@@ -413,7 +413,7 @@ test "evaluate: vuln severity gate" {
         .cvss = 7.5,
         .summary = try testing.allocator.dupe(u8, ""),
         .fixed_version = null,
-        .references = try testing.allocator.alloc([]u8, 0),
+        .references = try testing.allocator.alloc([]const u8, 0),
     };
     var vulns = try testing.allocator.alloc(vuln_mod.Vulnerability, 1);
     vulns[0] = v;
@@ -444,7 +444,7 @@ test "evaluate: vuln explicit deny" {
         .cvss = null,
         .summary = try testing.allocator.dupe(u8, ""),
         .fixed_version = null,
-        .references = try testing.allocator.alloc([]u8, 0),
+        .references = try testing.allocator.alloc([]const u8, 0),
     };
     var vulns = try testing.allocator.alloc(vuln_mod.Vulnerability, 1);
     vulns[0] = v;
@@ -637,7 +637,7 @@ test "evaluate: vuln severity below max passes" {
         .cvss = null,
         .summary = try testing.allocator.dupe(u8, ""),
         .fixed_version = null,
-        .references = try testing.allocator.alloc([]u8, 0),
+        .references = try testing.allocator.alloc([]const u8, 0),
     };
     var vulns = try testing.allocator.alloc(vuln_mod.Vulnerability, 1);
     vulns[0] = v;

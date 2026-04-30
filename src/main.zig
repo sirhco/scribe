@@ -17,6 +17,8 @@ const usage =
     \\  scribe config <path> [opts]    audit Dockerfile / k8s manifest ([--type dockerfile|kubernetes] [--json])
     \\  scribe scan <path> [opts]      full pipeline: SBOM + secrets + vulns ([--db p] [--include-generic] [--plain])
     \\  scribe policy <path> --policy <p>  evaluate scan results against policy ([--db d] [--config c] [--json]); exits 1 on fail
+    \\  scribe vulndb compile <in.json> <out.scvd>      compile JSON advisory DB to mmap-friendly binary (.scvd)
+    \\  scribe vulndb update --from <url> --out <p>     fetch advisory JSON over HTTPS, compile to .scvd
     \\  scribe symbols <path>          DWARF function symbols (ELF only)
     \\  scribe addr2line <path> <hex>  resolve address to source location
     \\  scribe fp generate <path> <lib> [version]    write fingerprint DB to stdout (JSON)
@@ -207,6 +209,39 @@ pub fn main(init: std.process.Init) !void {
         }
         runScan(io, gpa, stdout, args[2], db_path, config_path, sec_opts, plain) catch |err| return dieErr(stderr, err);
         return;
+    }
+    if (std.mem.eql(u8, cmd, "vulndb")) {
+        if (args.len < 3) return die(stderr, "error: 'vulndb' requires sub-action\n", 1);
+        const sub = args[2];
+        if (std.mem.eql(u8, sub, "compile")) {
+            if (args.len < 5) return die(stderr, "error: vulndb compile <in.json> <out.scvd>\n", 1);
+            runVulndbCompile(io, gpa, stdout, args[3], args[4]) catch |err| return dieErr(stderr, err);
+            return;
+        }
+        if (std.mem.eql(u8, sub, "update")) {
+            var from_url: ?[]const u8 = null;
+            var out_path: ?[]const u8 = null;
+            var idx: usize = 3;
+            while (idx < args.len) : (idx += 1) {
+                const a = args[idx];
+                if (std.mem.eql(u8, a, "--from")) {
+                    if (idx + 1 >= args.len) return die(stderr, "error: --from requires a URL\n", 1);
+                    idx += 1;
+                    from_url = args[idx];
+                } else if (std.mem.eql(u8, a, "--out")) {
+                    if (idx + 1 >= args.len) return die(stderr, "error: --out requires a path\n", 1);
+                    idx += 1;
+                    out_path = args[idx];
+                } else {
+                    return die(stderr, "error: unknown 'vulndb update' option\n", 1);
+                }
+            }
+            const url = from_url orelse return die(stderr, "error: vulndb update requires --from <url>\n", 1);
+            const op = out_path orelse return die(stderr, "error: vulndb update requires --out <path>\n", 1);
+            runVulndbUpdate(io, gpa, stdout, url, op) catch |err| return dieErr(stderr, err);
+            return;
+        }
+        return die(stderr, "error: vulndb <compile|update>\n", 1);
     }
     if (std.mem.eql(u8, cmd, "policy")) {
         if (args.len < 3) return die(stderr, "error: 'policy' requires a path\n", 1);
@@ -643,7 +678,7 @@ fn runVulns(
     var db_map = try scribe.mmap.open(io, db_path);
     defer db_map.deinit();
 
-    var db = try scribe.security.vulnerability.Database.parseJson(gpa, db_map.bytes());
+    var db = try scribe.security.vulnerability.load(gpa, db_map.bytes());
     defer db.deinit(gpa);
 
     var bom = try scribe.sbom.collect(gpa, target.bytes());
@@ -748,7 +783,7 @@ fn runScan(
     if (db_path) |dp| {
         var db_map = try scribe.mmap.open(io, dp);
         defer db_map.deinit();
-        var db = try scribe.security.vulnerability.Database.parseJson(gpa, db_map.bytes());
+        var db = try scribe.security.vulnerability.load(gpa, db_map.bytes());
         defer db.deinit(gpa);
 
         const refs = try gpa.alloc(scribe.security.vulnerability.ComponentRef, bom.components.len);
@@ -915,7 +950,7 @@ fn runPolicy(
     if (db_path) |dp| {
         var db_map = try scribe.mmap.open(io, dp);
         defer db_map.deinit();
-        var db = try scribe.security.vulnerability.Database.parseJson(gpa, db_map.bytes());
+        var db = try scribe.security.vulnerability.load(gpa, db_map.bytes());
         defer db.deinit(gpa);
         const refs = try gpa.alloc(scribe.security.vulnerability.ComponentRef, bom.components.len);
         defer gpa.free(refs);
@@ -974,6 +1009,79 @@ fn emitPolicyJson(out: *Io.Writer, r: scribe.security.policy.Result) !void {
     }
     if (r.violations.len > 0) try out.writeByte('\n');
     try out.writeAll("  ]\n}\n");
+}
+
+fn runVulndbCompile(
+    io: Io,
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    in_path: []const u8,
+    out_path: []const u8,
+) !void {
+    var in_map = try scribe.mmap.open(io, in_path);
+    defer in_map.deinit();
+
+    var db = try scribe.security.vulnerability.Database.parseJson(gpa, in_map.bytes());
+    defer db.deinit(gpa);
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try scribe.security.vulnerability.writeBinary(db, &aw.writer);
+    const bytes = aw.written();
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = bytes });
+
+    try out.print(
+        "compiled {d} advisories  ->  {s}  ({d} bytes)\n",
+        .{ db.advisories.len, out_path, bytes.len },
+    );
+}
+
+fn runVulndbUpdate(
+    io: Io,
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    url: []const u8,
+    out_path: []const u8,
+) !void {
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &body.writer,
+        .extra_headers = &.{
+            .{ .name = "Accept", .value = "application/json" },
+        },
+    }) catch |err| {
+        try out.print("error: HTTP fetch failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    if (result.status != .ok) {
+        try out.print("error: HTTP {d} from {s}\n", .{ @intFromEnum(result.status), url });
+        return error.NotImplemented;
+    }
+
+    const json_bytes = body.writer.buffered();
+    var db = scribe.security.vulnerability.Database.parseJson(gpa, json_bytes) catch |err| {
+        try out.print("error: advisory JSON parse failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer db.deinit(gpa);
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try scribe.security.vulnerability.writeBinary(db, &aw.writer);
+    const out_bytes = aw.written();
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = out_bytes });
+    try out.print(
+        "fetched {d} advisories from {s}  ->  {s}  ({d} bytes)\n",
+        .{ db.advisories.len, url, out_path, out_bytes.len },
+    );
 }
 
 fn writeJsonString(out: *Io.Writer, s: []const u8) !void {
