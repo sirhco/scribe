@@ -618,6 +618,38 @@ scribe scan ./stripped-binary --db osv.scvd --fp-db openssl-corpus.json
 
 ---
 
+## Terminal Output
+
+scribe's plain-mode emitters auto-detect whether stdout is a terminal and
+apply tasteful ANSI styling on TTYs. Behavior:
+
+- **TTY** (interactive shell): bold section headers, severity-colored
+  badges (`critical` red+bold on white, `high` red, `medium` yellow,
+  `low` cyan, `info` dim gray), bold rule IDs, dim labels, green/red
+  count totals, `✓`/`✗` glyphs on policy verdicts.
+- **Piped** (`scribe ... | jq`, `> file`, CI logs): color disabled
+  automatically. Output is plain ASCII so downstream tools (grep, awk,
+  diff) work cleanly.
+- **`NO_COLOR=1`** environment variable: color disabled even on a TTY.
+  Honors the [no-color.org](https://no-color.org/) convention.
+
+CycloneDX (`scribe scan`) and `--json` outputs are **always** machine-
+readable — color is applied only to the human plain-mode tables and the
+`scribe policy` verdict block.
+
+Severity color map:
+
+| Severity        | ANSI                                  |
+| --------------- | ------------------------------------- |
+| `critical`      | bold red on white background          |
+| `high`          | red                                   |
+| `medium` / `moderate` | yellow                          |
+| `low`           | cyan                                  |
+| `info`          | gray                                  |
+| `none`          | dim                                   |
+
+---
+
 ## Caveats
 
 - **Linear vuln-DB load cost on large feeds.** `parseJson` + `parseOsv`

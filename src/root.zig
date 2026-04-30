@@ -22,6 +22,7 @@ pub const fingerprint = @import("fingerprint.zig");
 pub const registry = @import("registry.zig");
 pub const local_docker = @import("local_docker.zig");
 pub const security = @import("security/mod.zig");
+pub const term = @import("term.zig");
 
 pub const ScribeError = errors.ScribeError;
 pub const Arch = elf.Arch;

@@ -46,6 +46,9 @@ pub fn main(init: std.process.Init) !void {
     const stdout = &stdout_fw.interface;
     defer stdout.flush() catch {};
 
+    // TTY-aware ANSI styling. Off when piped, off when NO_COLOR is set.
+    const style = scribe.term.Style.auto(io, init.minimal.environ);
+
     const args = try init.minimal.args.toSlice(arena);
     if (args.len < 2) return die(stderr, usage, 1);
 
@@ -109,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
         for (args[3..]) |a| {
             if (std.mem.eql(u8, a, "--plain")) plain = true;
         }
-        runSbom(io, gpa, stdout, args[2], plain) catch |err| return dieErr(stderr, err);
+        runSbom(io, gpa, stdout, args[2], plain, style) catch |err| return dieErr(stderr, err);
         return;
     }
     if (std.mem.eql(u8, cmd, "secrets")) {
@@ -134,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
                 return die(stderr, "error: unknown 'secrets' option\n", 1);
             }
         }
-        runSecrets(io, gpa, stdout, args[2], opts, json) catch |err| return dieErr(stderr, err);
+        runSecrets(io, gpa, stdout, args[2], opts, json, style) catch |err| return dieErr(stderr, err);
         return;
     }
     if (std.mem.eql(u8, cmd, "vulns")) {
@@ -155,7 +158,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         const db = db_path orelse return die(stderr, "error: 'vulns' requires --db <path>\n", 1);
-        runVulns(io, gpa, stdout, args[2], db, json) catch |err| return dieErr(stderr, err);
+        runVulns(io, gpa, stdout, args[2], db, json, style) catch |err| return dieErr(stderr, err);
         return;
     }
     if (std.mem.eql(u8, cmd, "config")) {
@@ -177,7 +180,7 @@ pub fn main(init: std.process.Init) !void {
                 return die(stderr, "error: unknown 'config' option\n", 1);
             }
         }
-        runConfig(io, gpa, stdout, args[2], ctype, json) catch |err| return dieErr(stderr, err);
+        runConfig(io, gpa, stdout, args[2], ctype, json, style) catch |err| return dieErr(stderr, err);
         return;
     }
     if (std.mem.eql(u8, cmd, "scan")) {
@@ -217,7 +220,7 @@ pub fn main(init: std.process.Init) !void {
                 return die(stderr, "error: unknown 'scan' option\n", 1);
             }
         }
-        runScan(io, gpa, stdout, args[2], db_path, config_path, fp_db_path, sec_opts, plain) catch |err| return dieErr(stderr, err);
+        runScan(io, gpa, stdout, args[2], db_path, config_path, fp_db_path, sec_opts, plain, style) catch |err| return dieErr(stderr, err);
         return;
     }
     if (std.mem.eql(u8, cmd, "vulndb")) {
@@ -284,7 +287,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         const pp = policy_path orelse return die(stderr, "error: 'policy' requires --policy <path>\n", 1);
-        const code = runPolicy(io, gpa, stdout, args[2], pp, db_path, config_path, sec_opts, json) catch |err| return dieErr(stderr, err);
+        const code = runPolicy(io, gpa, stdout, args[2], pp, db_path, config_path, sec_opts, json, style) catch |err| return dieErr(stderr, err);
         stdout.flush() catch {};
         std.process.exit(code);
     }
@@ -435,18 +438,19 @@ fn runSbom(
     out: *Io.Writer,
     path: []const u8,
     plain: bool,
+    style: scribe.term.Style,
 ) !void {
     if (std.mem.startsWith(u8, path, "registry://")) {
         var bom = try scribe.registry.pullSbom(gpa, io, path, .{});
         defer bom.deinit(gpa);
-        try emitSbom(out, .{ .components = bom.components, .config_issues = bom.config_issues }, plain);
+        try emitSbom(out, .{ .components = bom.components, .config_issues = bom.config_issues }, plain, style);
         return;
     }
 
     if (scribe.local_docker.isLocalDockerUri(path)) {
         var bom = try scribe.local_docker.pullSbom(gpa, io, path);
         defer bom.deinit(gpa);
-        try emitSbom(out, .{ .components = bom.components, .config_issues = bom.config_issues }, plain);
+        try emitSbom(out, .{ .components = bom.components, .config_issues = bom.config_issues }, plain, style);
         return;
     }
 
@@ -457,37 +461,59 @@ fn runSbom(
     if (scribe.container.isContainer(bytes)) {
         var bom = try scribe.container.collect(gpa, bytes);
         defer bom.deinit(gpa);
-        try emitSbom(out, .{ .components = bom.components, .config_issues = bom.config_issues }, plain);
+        try emitSbom(out, .{ .components = bom.components, .config_issues = bom.config_issues }, plain, style);
     } else {
         var bom = try scribe.sbom.collect(gpa, bytes);
         defer bom.deinit(gpa);
-        try emitSbom(out, bom, plain);
+        try emitSbom(out, bom, plain, style);
     }
 }
 
-fn emitSbom(out: *Io.Writer, bom: scribe.sbom.Sbom, plain: bool) !void {
+fn emitSbom(out: *Io.Writer, bom: scribe.sbom.Sbom, plain: bool, style: scribe.term.Style) !void {
     if (plain) {
         if (bom.components.len == 0) {
-            try out.writeAll("(no components detected)\n");
+            try style.span(out, scribe.term.codes.dim, "(no components detected)");
+            try out.writeByte('\n');
             return;
         }
         for (bom.components) |c| {
-            try out.print(
-                "{s:<13} {s:<28} {s:<16} {s:<14} via={s}",
-                .{
-                    @tagName(c.kind),
-                    c.name,
-                    c.version orelse "-",
-                    c.platform orelse "-",
-                    @tagName(c.evidence),
-                },
-            );
-            if (c.path) |p| try out.print(" @ {s}", .{p});
+            // kind (cyan) + name (default) + version (bright) + platform + evidence (dim)
+            try style.span(out, scribe.term.codes.cyan, @tagName(c.kind));
+            try out.writeAll(" ");
+            // pad to width 13 manually so ANSI codes don't break alignment.
+            try padTo(out, @tagName(c.kind).len, 13);
+            try out.print("{s:<28} ", .{c.name});
+            if (c.version) |v| {
+                try style.span(out, scribe.term.codes.bright_yellow, v);
+                try padTo(out, v.len, 16);
+            } else {
+                try out.writeAll("-");
+                try padTo(out, 1, 16);
+            }
+            try out.print("{s:<14} ", .{c.platform orelse "-"});
+            try style.dim(out, "via=");
+            try style.dim(out, @tagName(c.evidence));
+            if (c.path) |p| {
+                try out.writeAll(" ");
+                try style.dim(out, "@ ");
+                try style.dim(out, p);
+            }
             try out.writeByte('\n');
         }
     } else {
         try scribe.sbom.writeCycloneDX(out, bom);
     }
+}
+
+/// Pad with spaces from `current_len` to `target_width`. Keeps columns
+/// aligned even when ANSI sequences inflate the byte length.
+fn padTo(out: *Io.Writer, current_len: usize, target_width: usize) !void {
+    if (current_len >= target_width) {
+        try out.writeByte(' ');
+        return;
+    }
+    var i: usize = 0;
+    while (i < target_width - current_len) : (i += 1) try out.writeByte(' ');
 }
 
 fn stripHexPrefix(s: []const u8) []const u8 {
@@ -625,6 +651,7 @@ fn runSecrets(
     path: []const u8,
     opts: scribe.security.secrets.ScanOptions,
     json: bool,
+    style: scribe.term.Style,
 ) !void {
     var mapping = try scribe.mmap.open(io, path);
     defer mapping.deinit();
@@ -635,27 +662,32 @@ fn runSecrets(
     if (json) {
         try emitFindingsJson(out, findings);
     } else {
-        try emitFindingsPlain(out, findings);
+        try emitFindingsPlain(out, findings, style);
     }
 }
 
-fn emitFindingsPlain(out: *Io.Writer, findings: scribe.security.secrets.Findings) !void {
+fn emitFindingsPlain(
+    out: *Io.Writer,
+    findings: scribe.security.secrets.Findings,
+    style: scribe.term.Style,
+) !void {
     if (findings.items.len == 0) {
-        try out.writeAll("(no secrets detected)\n");
+        try style.span(out, scribe.term.codes.bold_green, "✓ no secrets detected");
+        try out.writeByte('\n');
         return;
     }
     for (findings.items) |f| {
-        try out.print(
-            "{s:<22}  off=0x{x:0>8}  conf={d:>3}  {s}\n",
-            .{
-                @tagName(f.kind),
-                f.offset,
-                @intFromEnum(f.confidence),
-                f.redacted_preview,
-            },
-        );
+        // kind (yellow), label-dim, value, severity-colored confidence
+        try style.span(out, scribe.term.codes.bright_yellow, @tagName(f.kind));
+        try out.writeAll("  ");
+        try style.dim(out, "off=");
+        try out.print("0x{x:0>8}  ", .{f.offset});
+        try style.dim(out, "conf=");
+        try out.print("{d:>3}  ", .{@intFromEnum(f.confidence)});
+        try out.writeAll(f.redacted_preview);
+        try out.writeByte('\n');
     }
-    try out.print("({d} findings)\n", .{findings.items.len});
+    try style.writeCount(out, findings.items.len, "findings");
 }
 
 fn emitFindingsJson(out: *Io.Writer, findings: scribe.security.secrets.Findings) !void {
@@ -682,6 +714,7 @@ fn runVulns(
     target_path: []const u8,
     db_path: []const u8,
     json: bool,
+    style: scribe.term.Style,
 ) !void {
     var target = try scribe.mmap.open(io, target_path);
     defer target.deinit();
@@ -706,31 +739,47 @@ fn runVulns(
     if (json) {
         try emitVulnsJson(out, vulns);
     } else {
-        try emitVulnsPlain(out, vulns);
+        try emitVulnsPlain(out, vulns, style);
     }
 }
 
-fn emitVulnsPlain(out: *Io.Writer, vulns: scribe.security.vulnerability.Vulnerabilities) !void {
+fn emitVulnsPlain(
+    out: *Io.Writer,
+    vulns: scribe.security.vulnerability.Vulnerabilities,
+    style: scribe.term.Style,
+) !void {
     if (vulns.items.len == 0) {
-        try out.writeAll("(no advisories matched)\n");
+        try style.span(out, scribe.term.codes.bold_green, "✓ no advisories matched");
+        try out.writeByte('\n');
         return;
     }
     for (vulns.items) |v| {
-        try out.print(
-            "{s:<18}  {s}{s}{s}  [{s}]",
-            .{
-                v.advisory_id,
-                v.package,
-                if (v.matched_version != null) "@" else "",
-                v.matched_version orelse "",
-                @tagName(v.severity),
-            },
-        );
-        if (v.cvss) |c| try out.print(" cvss={d:.1}", .{c});
-        if (v.fixed_version) |f| try out.print(" fixed={s}", .{f});
-        try out.print("\n  {s}\n", .{v.summary});
+        // advisory id bold; package@version normal; severity colored.
+        try style.bold(out, v.advisory_id);
+        try out.writeAll("  ");
+        try out.writeAll(v.package);
+        if (v.matched_version) |mv| {
+            try style.dim(out, "@");
+            try out.writeAll(mv);
+        }
+        try out.writeAll("  [");
+        try style.writeSeverity(out, @tagName(v.severity));
+        try out.writeByte(']');
+        if (v.cvss) |c| {
+            try out.writeAll(" ");
+            try style.dim(out, "cvss=");
+            try out.print("{d:.1}", .{c});
+        }
+        if (v.fixed_version) |f| {
+            try out.writeAll(" ");
+            try style.dim(out, "fixed=");
+            try out.writeAll(f);
+        }
+        try out.writeAll("\n  ");
+        try style.dim(out, v.summary);
+        try out.writeByte('\n');
     }
-    try out.print("({d} vulnerabilities)\n", .{vulns.items.len});
+    try style.writeCount(out, vulns.items.len, "vulnerabilities");
 }
 
 fn emitVulnsJson(out: *Io.Writer, vulns: scribe.security.vulnerability.Vulnerabilities) !void {
@@ -779,6 +828,7 @@ fn runScan(
     fp_db_path: ?[]const u8,
     sec_opts: scribe.security.secrets.ScanOptions,
     plain: bool,
+    style: scribe.term.Style,
 ) !void {
     var target = try scribe.mmap.open(io, target_path);
     defer target.deinit();
@@ -848,48 +898,114 @@ fn runScan(
     }
 
     if (plain) {
-        try emitSbom(out, bom, true);
+        // Components header
+        try writeSection(out, style, "components");
+        try emitSbom(out, bom, true, style);
+
         if (bom.findings.len > 0) {
-            try out.writeAll("\nsecrets:\n");
+            try out.writeByte('\n');
+            try writeSection(out, style, "secrets");
             for (bom.findings) |f| {
-                try out.print(
-                    "  {s:<22}  off=0x{x:0>8}  conf={d:>3}  {s}\n",
-                    .{ @tagName(f.kind), f.offset, @intFromEnum(f.confidence), f.redacted_preview },
-                );
+                try out.writeAll("  ");
+                try style.span(out, scribe.term.codes.bright_yellow, @tagName(f.kind));
+                try out.writeAll("  ");
+                try style.dim(out, "off=");
+                try out.print("0x{x:0>8}  ", .{f.offset});
+                try style.dim(out, "conf=");
+                try out.print("{d:>3}  ", .{@intFromEnum(f.confidence)});
+                try out.writeAll(f.redacted_preview);
+                try out.writeByte('\n');
             }
         }
         if (bom.vulnerabilities.len > 0) {
-            try out.writeAll("\nvulnerabilities:\n");
+            try out.writeByte('\n');
+            try writeSection(out, style, "vulnerabilities");
             for (bom.vulnerabilities) |v| {
-                try out.print(
-                    "  {s:<18}  {s}{s}{s}  [{s}]\n",
-                    .{
-                        v.advisory_id,
-                        v.package,
-                        if (v.matched_version != null) "@" else "",
-                        v.matched_version orelse "",
-                        @tagName(v.severity),
-                    },
-                );
+                try out.writeAll("  ");
+                try style.bold(out, v.advisory_id);
+                try out.writeAll("  ");
+                try out.writeAll(v.package);
+                if (v.matched_version) |mv| {
+                    try style.dim(out, "@");
+                    try out.writeAll(mv);
+                }
+                try out.writeAll("  [");
+                try style.writeSeverity(out, @tagName(v.severity));
+                try out.writeAll("]\n");
             }
         }
         if (bom.config_issues.len > 0) {
-            try out.writeAll("\nconfig issues:\n");
+            try out.writeByte('\n');
+            try writeSection(out, style, "config issues");
             for (bom.config_issues) |it| {
-                try out.print(
-                    "  {s:<7}  [{s:<8}]  {s}",
-                    .{ it.rule_id, @tagName(it.severity), it.title },
-                );
+                try out.writeAll("  ");
+                try style.bold(out, it.rule_id);
+                try out.writeAll("  [");
+                try style.writeSeverity(out, @tagName(it.severity));
+                try out.writeAll("]  ");
+                try out.writeAll(it.title);
                 if (it.line > 0) {
-                    try out.print("  ({s}:{d})\n", .{ it.file, it.line });
+                    try out.writeAll("  ");
+                    try style.dim(out, "(");
+                    try style.dim(out, it.file);
+                    try style.dim(out, ":");
+                    var lbuf: [16]u8 = undefined;
+                    const ls = std.fmt.bufPrint(&lbuf, "{d}", .{it.line}) catch "?";
+                    try style.dim(out, ls);
+                    try style.dim(out, ")");
                 } else {
-                    try out.print("  ({s})\n", .{it.file});
+                    try out.writeAll("  ");
+                    try style.dim(out, "(");
+                    try style.dim(out, it.file);
+                    try style.dim(out, ")");
                 }
+                try out.writeByte('\n');
             }
         }
+
+        // Trailer summary line.
+        try out.writeByte('\n');
+        try writeSummary(out, style, bom);
     } else {
         try scribe.sbom.writeCycloneDX(out, bom);
     }
+}
+
+fn writeSection(out: *Io.Writer, style: scribe.term.Style, label: []const u8) !void {
+    try style.span(out, scribe.term.codes.bold, label);
+    try style.dim(out, ":");
+    try out.writeByte('\n');
+}
+
+fn writeSummary(out: *Io.Writer, style: scribe.term.Style, bom: scribe.sbom.Sbom) !void {
+    try style.bold(out, "summary");
+    try style.dim(out, ":  ");
+    try out.print("{d} components", .{bom.components.len});
+    try style.dim(out, ", ");
+    if (bom.findings.len == 0) {
+        try style.span(out, scribe.term.codes.green, "0 secrets");
+    } else {
+        try style.span(out, scribe.term.codes.bold_red, "");
+        try out.print("{d} secrets", .{bom.findings.len});
+        try style.close(out);
+    }
+    try style.dim(out, ", ");
+    if (bom.vulnerabilities.len == 0) {
+        try style.span(out, scribe.term.codes.green, "0 vulns");
+    } else {
+        try style.open(out, scribe.term.codes.bold_red);
+        try out.print("{d} vulns", .{bom.vulnerabilities.len});
+        try style.close(out);
+    }
+    try style.dim(out, ", ");
+    if (bom.config_issues.len == 0) {
+        try style.span(out, scribe.term.codes.green, "0 config issues");
+    } else {
+        try style.open(out, scribe.term.codes.bold_red);
+        try out.print("{d} config issues", .{bom.config_issues.len});
+        try style.close(out);
+    }
+    try out.writeByte('\n');
 }
 
 fn runConfig(
@@ -899,6 +1015,7 @@ fn runConfig(
     path: []const u8,
     ctype: scribe.security.config.ConfigType,
     json: bool,
+    style: scribe.term.Style,
 ) !void {
     var mapping = try scribe.mmap.open(io, path);
     defer mapping.deinit();
@@ -909,30 +1026,53 @@ fn runConfig(
     if (json) {
         try emitConfigJson(out, issues);
     } else {
-        try emitConfigPlain(out, issues);
+        try emitConfigPlain(out, issues, style);
     }
 }
 
-fn emitConfigPlain(out: *Io.Writer, issues: scribe.security.config.Issues) !void {
+fn emitConfigPlain(
+    out: *Io.Writer,
+    issues: scribe.security.config.Issues,
+    style: scribe.term.Style,
+) !void {
     if (issues.items.len == 0) {
-        try out.writeAll("(no misconfigurations found)\n");
+        try style.span(out, scribe.term.codes.bold_green, "✓ no misconfigurations found");
+        try out.writeByte('\n');
         return;
     }
     for (issues.items) |it| {
-        try out.print(
-            "{s:<6}  [{s}]  {s}",
-            .{ it.rule_id, @tagName(it.severity), it.title },
-        );
+        try style.bold(out, it.rule_id);
+        try out.writeAll("  [");
+        try style.writeSeverity(out, @tagName(it.severity));
+        try out.writeAll("]  ");
+        try out.writeAll(it.title);
+        try out.writeAll("  ");
         if (it.line > 0) {
-            try out.print("  ({s}:{d})", .{ it.file, it.line });
+            try style.dim(out, "(");
+            try style.dim(out, it.file);
+            try style.span(out, scribe.term.codes.dim, ":");
+            var lbuf: [16]u8 = undefined;
+            const ls = std.fmt.bufPrint(&lbuf, "{d}", .{it.line}) catch "?";
+            try style.dim(out, ls);
+            try style.dim(out, ")");
         } else {
-            try out.print("  ({s})", .{it.file});
+            try style.dim(out, "(");
+            try style.dim(out, it.file);
+            try style.dim(out, ")");
         }
         try out.writeByte('\n');
-        if (it.snippet.len > 0) try out.print("        > {s}\n", .{it.snippet});
-        if (it.recommendation.len > 0) try out.print("        fix: {s}\n", .{it.recommendation});
+        if (it.snippet.len > 0) {
+            try style.dim(out, "        > ");
+            try out.writeAll(it.snippet);
+            try out.writeByte('\n');
+        }
+        if (it.recommendation.len > 0) {
+            try style.span(out, scribe.term.codes.cyan, "        fix: ");
+            try out.writeAll(it.recommendation);
+            try out.writeByte('\n');
+        }
     }
-    try out.print("({d} issues)\n", .{issues.items.len});
+    try style.writeCount(out, issues.items.len, "issues");
 }
 
 fn emitConfigJson(out: *Io.Writer, issues: scribe.security.config.Issues) !void {
@@ -973,6 +1113,7 @@ fn runPolicy(
     config_path: ?[]const u8,
     sec_opts: scribe.security.secrets.ScanOptions,
     json: bool,
+    style: scribe.term.Style,
 ) !u8 {
     var policy_map = try scribe.mmap.open(io, policy_path);
     defer policy_map.deinit();
@@ -1038,23 +1179,38 @@ fn runPolicy(
     if (json) {
         try emitPolicyJson(out, result);
     } else {
-        try emitPolicyPlain(out, result);
+        try emitPolicyPlain(out, result, style);
     }
 
     return if (result.verdict == .pass) @as(u8, 0) else @as(u8, 1);
 }
 
-fn emitPolicyPlain(out: *Io.Writer, r: scribe.security.policy.Result) !void {
-    try out.print("verdict: {s}\n", .{@tagName(r.verdict)});
-    if (r.violations.len == 0) return;
-    try out.writeAll("violations:\n");
-    for (r.violations) |v| {
-        try out.print(
-            "  [{s}]  {s}  -> {s}  ({s})\n",
-            .{ @tagName(v.axis), v.rule, v.detail, v.severity_text },
-        );
+fn emitPolicyPlain(out: *Io.Writer, r: scribe.security.policy.Result, style: scribe.term.Style) !void {
+    try style.bold(out, "verdict");
+    try style.dim(out, ": ");
+    if (r.verdict == .pass) {
+        try style.span(out, scribe.term.codes.bold_green, "✓ pass");
+    } else {
+        try style.span(out, scribe.term.codes.bold_red, "✗ fail");
     }
-    try out.print("({d} violations)\n", .{r.violations.len});
+    try out.writeByte('\n');
+    if (r.violations.len == 0) return;
+    try style.bold(out, "violations");
+    try style.dim(out, ":");
+    try out.writeByte('\n');
+    for (r.violations) |v| {
+        try out.writeAll("  [");
+        try style.span(out, scribe.term.codes.bright_yellow, @tagName(v.axis));
+        try out.writeAll("]  ");
+        try style.dim(out, v.rule);
+        try out.writeAll("  ");
+        try style.dim(out, "→ ");
+        try style.bold(out, v.detail);
+        try out.writeAll("  (");
+        try style.writeSeverity(out, v.severity_text);
+        try out.writeAll(")\n");
+    }
+    try style.writeCount(out, r.violations.len, "violations");
 }
 
 fn emitPolicyJson(out: *Io.Writer, r: scribe.security.policy.Result) !void {
