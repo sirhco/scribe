@@ -46,11 +46,11 @@ Scribe is a high-performance, cross-platform binary forensics library and CLI wr
 | 5c    | Security: IaC audit (Dockerfile + Kubernetes + OCI image-config)   | done  |
 | 5d    | Security: policy gate, fingerprint cross-ref, `scribe scan` umbrella | done  |
 | 5e    | Security: vulndb merge, NVD CVE 2.0 ingest, CVSS v2 parser           | done  |
-| 5e-ext | IaC audit driven by an AST YAML walker (multi-doc, anchors/aliases, block + flow style, Helm `{{ ... }}` tolerated) | done |
+| 5e-ext | IaC audit driven by an AST YAML walker (multi-doc, anchors/aliases, merge keys (`<<:`), YAML 1.1 booleans, block + flow style, Helm `{{ ... }}` tolerated) | done |
 | 3b-ext | Sliding-window fingerprint match (stripped binaries) + x86_64 relocation-normalized hashes (E8/E9/0F8x branches, RIP-relative ModR/M loads/stores/LEAs/indirect calls) | done |
 | 3c-ext | `docker save` stdout spooled straight to a tempfile (no in-memory cap); outer-tar walk is zero-copy via mmap so resident memory tracks the working set, not the image size | done |
 
-Tests: 146 unit + integration tests (`zig build test`).
+Tests: 149 unit + integration tests (`zig build test`).
 
 ---
 
@@ -431,7 +431,7 @@ Module surface:
 | `scribe.security.vulnerability` | Advisory matcher (OSV-lite, OSV native, SCVD binary) |
 | `scribe.security.config`      | IaC audit (Dockerfile, Kubernetes, OCI image-config) |
 | `scribe.security.policy`      | JSON-driven gatekeeper over a populated `Sbom`       |
-| `scribe.yaml`                 | YAML 1.2 subset parser (multi-doc, anchors/aliases, block + flow, Helm tolerated) — backs the Kubernetes audit |
+| `scribe.yaml`                 | YAML 1.2 subset parser (multi-doc, anchors/aliases, merge keys, YAML 1.1 booleans, block + flow, Helm tolerated) — backs the Kubernetes audit |
 
 All public APIs allocate via the caller's allocator; no implicit globals.
 `*Info` and `Sbom` types own their string buffers and require explicit
@@ -596,14 +596,14 @@ mmap-spooled `docker save`). Open work:
 | 3c-ext+ | The full `docker save` tar is now spooled to a tempfile and walked via mmap rather than copied through the heap (the previous 8 GiB RAM cap is gone). True single-pass streaming from a `Reader` would still be a refactor of `container.collect` itself, since manifest.json forward-references layer blobs that may appear later in the stream — the spool-and-mmap path delivers the same memory savings without that surgery. |
 | 4b+     | Mach-O `.dSYM` symbol enumeration ships and the CLI auto-resolves `<bin>.dSYM/...`. Source-line lookup currently bails on `error.InvalidDebugInfo` for DWARF 5 line programs whose file-name forms reference `__debug_line_str`; this is in `std.debug.Dwarf`'s line-program decoder, not in scribe — once the upstream path lands, `addr2line` will start working with no scribe-side change. |
 | 4c      | PE PDB parsing — scribe extracts the PDB GUID from the debug directory, but std.zig has no PDB parser. Multi-week port from the LLVM/MSF reverse-engineered docs. |
-| 5e-ext+ | YAML parser is a deliberate 1.2 subset — no merge keys (`<<:`), no YAML 1.1 booleans (`yes`/`no`/`on`/`off`), no complex keys (`?`). Covers every k8s manifest shape we've audited; widening to full 1.2 is on the table if real users hit it. |
+| 5e-ext+ | YAML parser still doesn't handle complex keys (`?`-introduced) or the YAML 1.1 sexagesimal/binary integer notations. Neither shape appears in real Kubernetes / Helm manifests we've seen — kept on the list only so the gap is documented. |
 | 6       | Function-flow CFG construction, anti-tampering checks, yara-style rule integration — research direction; deeper static analysis as a foundation for `scribe-live` correlation. |
 
 The `3b-ext+` / `3c-ext+` / `4b+` / `5e-ext+` rows are **partials** —
 the core capability is shipped (RIP-relative-aware normalized hashes,
 mmap-spooled `docker save`, Mach-O `.dSYM` symbol enumeration, AST YAML
-walker covering anchors / aliases / flow / Helm) but the underlying
-architectural item flagged above is the natural follow-on. `4b+` is
-specifically blocked on a `std.debug.Dwarf` line-program bug, not on
-scribe-side work. `4c` and `6` are genuinely future work — not
-single-session deliverables.
+walker covering anchors / aliases / merge keys / 1.1 booleans / flow /
+Helm) but the underlying architectural item flagged above is the
+natural follow-on. `4b+` is specifically blocked on a
+`std.debug.Dwarf` line-program bug, not on scribe-side work. `4c` and
+`6` are genuinely future work — not single-session deliverables.

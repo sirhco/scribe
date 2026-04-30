@@ -449,6 +449,30 @@ fn auditK8sDocument(
     }
 }
 
+/// Compare a YAML scalar to a rule's expected value, accepting YAML 1.1
+/// boolean aliases (`yes`/`no`/`on`/`off` and case variants) when the
+/// expected value is `true` or `false`. Older Helm charts and ops-team
+/// k8s manifests still use the 1.1 spelling for booleans, so we normalize
+/// before matching rather than forcing the rules to enumerate every case.
+fn scalarMatches(scalar: []const u8, expected: []const u8) bool {
+    if (std.mem.eql(u8, scalar, expected)) return true;
+    if (std.mem.eql(u8, expected, "true")) return isYamlTrue(scalar);
+    if (std.mem.eql(u8, expected, "false")) return isYamlFalse(scalar);
+    return false;
+}
+
+fn isYamlTrue(s: []const u8) bool {
+    const aliases = [_][]const u8{ "true", "True", "TRUE", "yes", "Yes", "YES", "on", "On", "ON" };
+    for (aliases) |a| if (std.mem.eql(u8, s, a)) return true;
+    return false;
+}
+
+fn isYamlFalse(s: []const u8) bool {
+    const aliases = [_][]const u8{ "false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF" };
+    for (aliases) |a| if (std.mem.eql(u8, s, a)) return true;
+    return false;
+}
+
 fn isWorkloadKind(kind: []const u8) bool {
     const kinds = [_][]const u8{
         "Pod", "Deployment", "StatefulSet", "DaemonSet",
@@ -479,7 +503,7 @@ fn findKvAndAdd(
         .mapping => {
             for (node.map) |kv| {
                 if (std.mem.eql(u8, kv.key, key) and kv.value.kind == .scalar and
-                    std.mem.eql(u8, kv.value.scalar, expected))
+                    scalarMatches(kv.value.scalar, expected))
                 {
                     try addIssue(allocator, list, .{
                         .rule_id = rule_id,
@@ -964,6 +988,57 @@ test "Kubernetes: SYS_ADMIN capability flagged" {
     var r = try auditKubernetes(testing.allocator, manifest, "p.yaml");
     defer r.deinit(testing.allocator);
     try testing.expect(hasRule(r.items, "K8S007"));
+}
+
+test "Kubernetes: YAML 1.1 boolean aliases trigger bool rules" {
+    // `privileged: yes` and `hostNetwork: On` are YAML 1.1 spellings of
+    // true. Older k8s base configs and Helm output still emit them; the
+    // audit must treat them the same as `: true`.
+    const manifest =
+        \\apiVersion: v1
+        \\kind: Pod
+        \\metadata: {name: legacy}
+        \\spec:
+        \\  hostNetwork: On
+        \\  containers:
+        \\  - name: c
+        \\    image: a:1
+        \\    securityContext:
+        \\      privileged: yes
+        \\      runAsNonRoot: NO
+        \\    resources: {limits: {cpu: "1"}}
+    ;
+    var r = try auditKubernetes(testing.allocator, manifest, "legacy.yaml");
+    defer r.deinit(testing.allocator);
+    try testing.expect(hasRule(r.items, "K8S004")); // hostNetwork: On
+    try testing.expect(hasRule(r.items, "K8S006")); // privileged: yes
+    try testing.expect(hasRule(r.items, "K8S001")); // runAsNonRoot: NO
+}
+
+test "Kubernetes: merge key inlines anchored securityContext" {
+    // Common Helm pattern: anchor a "bad defaults" block, merge it into a
+    // workload's securityContext. The audit must see the merged keys, not
+    // just the anchor itself.
+    const manifest =
+        \\bad: &bad
+        \\  privileged: true
+        \\  hostNetwork: true
+        \\---
+        \\apiVersion: v1
+        \\kind: Pod
+        \\metadata: {name: p}
+        \\spec:
+        \\  <<: *bad
+        \\  containers:
+        \\  - name: c
+        \\    image: a:1
+        \\    securityContext: {}
+        \\    resources: {limits: {cpu: "1"}}
+    ;
+    var r = try auditKubernetes(testing.allocator, manifest, "merged.yaml");
+    defer r.deinit(testing.allocator);
+    try testing.expect(hasRule(r.items, "K8S004")); // hostNetwork from merge
+    try testing.expect(hasRule(r.items, "K8S006")); // privileged from merge
 }
 
 test "Kubernetes: multi-doc separates rules per document" {

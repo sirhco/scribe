@@ -390,6 +390,14 @@ const Parser = struct {
             for (entries.items) |*kv| kv.deinit(self.allocator);
             entries.deinit(self.allocator);
         }
+        // Merge-key (`<<: *anchor` / `<<: [*a, *b]`) values are deferred to
+        // the end of the map so explicit keys — wherever they appear in
+        // source order — always override merged ones, per YAML 1.1.
+        var merges: std.ArrayList(Node) = .empty;
+        defer {
+            for (merges.items) |*n| n.deinit(self.allocator);
+            merges.deinit(self.allocator);
+        }
 
         const start_line = self.line;
         // The first iteration may begin mid-line (e.g. when a block sequence
@@ -446,7 +454,29 @@ const Parser = struct {
 
             // Strip trailing inline comment from the rest of the line.
             const rest_end = stripInlineComment(self.src[self.pos..line_end]);
-            const rest = self.src[self.pos .. self.pos + rest_end];
+            var rest = self.src[self.pos .. self.pos + rest_end];
+
+            // A bare `&anchor` on the rest of the line (with no inline
+            // value following it) introduces a deferred block value on
+            // subsequent lines. Strip the anchor here so the empty-rest
+            // path below parses the block, and stash the name so we can
+            // register it once we have the real value.
+            var pending_anchor: ?[]const u8 = null;
+            {
+                const trimmed_rest = std.mem.trim(u8, rest, " \t");
+                if (trimmed_rest.len > 0 and trimmed_rest[0] == '&') {
+                    var j: usize = 1;
+                    while (j < trimmed_rest.len and trimmed_rest[j] != ' ' and trimmed_rest[j] != '\t') j += 1;
+                    const tail = std.mem.trim(u8, trimmed_rest[j..], " \t");
+                    if (tail.len == 0) {
+                        pending_anchor = trimmed_rest[1..j];
+                        // Consume the anchor token from the source so the
+                        // empty-rest branch sees no inline content.
+                        self.pos = line_end;
+                        rest = self.src[line_end..line_end];
+                    }
+                }
+            }
 
             var value: Node = undefined;
             if (rest.len == 0) {
@@ -487,7 +517,25 @@ const Parser = struct {
                 self.consumeNewline();
             }
 
+            if (pending_anchor) |aname| {
+                try self.storeAnchor(aname, value);
+            }
+
+            if (std.mem.eql(u8, key, "<<")) {
+                // YAML 1.1 merge key. Stash the source mapping(s); apply
+                // after explicit entries are gathered so source-order
+                // overrides win regardless of where `<<` sits.
+                self.allocator.free(key);
+                merges.append(self.allocator, value) catch return error.OutOfMemory;
+                continue;
+            }
             entries.append(self.allocator, .{ .key = key, .value = value, .line = kv_line }) catch return error.OutOfMemory;
+        }
+
+        // Apply deferred merges: append entries from each merge source
+        // whose key isn't already present.
+        for (merges.items) |merge_src| {
+            try applyMerge(self.allocator, &entries, merge_src);
         }
 
         const items = entries.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
@@ -846,6 +894,42 @@ const Parser = struct {
     }
 };
 
+/// Apply a YAML 1.1 merge-key source to an entry list. Per the merge-key
+/// spec, the source may be either a single mapping or a sequence of
+/// mappings (right-most wins among the sources, but explicit keys in the
+/// outer mapping override every merged source — so we only insert keys
+/// that are not already present).
+fn applyMerge(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayList(KeyValue),
+    src: Node,
+) Error!void {
+    switch (src.kind) {
+        .mapping => {
+            for (src.map) |inner_kv| {
+                if (entryHasKey(entries.items, inner_kv.key)) continue;
+                const k_dup = try allocator.dupe(u8, inner_kv.key);
+                errdefer allocator.free(k_dup);
+                const v_dup = try cloneNode(allocator, inner_kv.value);
+                entries.append(allocator, .{ .key = k_dup, .value = v_dup, .line = inner_kv.line }) catch return error.OutOfMemory;
+            }
+        },
+        .sequence => {
+            for (src.seq) |item| {
+                if (item.kind == .mapping) try applyMerge(allocator, entries, item);
+            }
+        },
+        .scalar => {}, // ignore scalar merge sources (malformed input)
+    }
+}
+
+fn entryHasKey(items: []const KeyValue, key: []const u8) bool {
+    for (items) |kv| {
+        if (std.mem.eql(u8, kv.key, key)) return true;
+    }
+    return false;
+}
+
 fn cloneNode(allocator: std.mem.Allocator, node: Node) std.mem.Allocator.Error!Node {
     return switch (node.kind) {
         .scalar => Node{
@@ -1013,22 +1097,35 @@ test "multi-doc separator" {
 
 test "anchors and aliases" {
     const src =
-        \\base: &b
-        \\  level: high
-        \\  retries: 3
-        \\applied:
-        \\  <<: *b
-    ;
-    _ = src;
-    // Simpler anchor/alias test that doesn't use merge keys (out of scope).
-    const src2 =
         \\base: &b "shared-string"
         \\copy: *b
     ;
-    var s = try parse(testing.allocator, src2);
+    var s = try parse(testing.allocator, src);
     defer s.deinit(testing.allocator);
     try testing.expectEqualStrings("shared-string", s.documents[0].root.getScalar("base").?);
     try testing.expectEqualStrings("shared-string", s.documents[0].root.getScalar("copy").?);
+}
+
+test "merge key (`<<:`) inlines anchored mapping with explicit-override precedence" {
+    const src =
+        \\defaults: &d
+        \\  level: high
+        \\  retries: 3
+        \\  privileged: true
+        \\applied:
+        \\  <<: *d
+        \\  level: critical
+    ;
+    var s = try parse(testing.allocator, src);
+    defer s.deinit(testing.allocator);
+    const applied = s.documents[0].root.get("applied").?;
+    // Explicit `level: critical` wins over merged `level: high`.
+    try testing.expectEqualStrings("critical", applied.getScalar("level").?);
+    // Other keys come from the merge.
+    try testing.expectEqualStrings("3", applied.getScalar("retries").?);
+    try testing.expectEqualStrings("true", applied.getScalar("privileged").?);
+    // The synthetic `<<` key itself must not appear in the result.
+    try testing.expect(applied.get("<<") == null);
 }
 
 test "flow style" {

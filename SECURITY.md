@@ -939,10 +939,12 @@ Severity color map:
   pairs or BMP characters above 0x7E. Adequate for secret detection.
 - **YAML audit walks an AST.** The Kubernetes path parses every
   manifest into a YAML 1.2-subset tree (multi-doc, anchors / aliases,
-  block + flow style, Helm `{{ ... }}` tolerated as opaque scalars) and
-  then walks it for rule matches. Deliberate gaps: no merge keys
-  (`<<:`), no YAML 1.1 booleans (`yes`/`no`/`on`/`off`), no complex
-  keys (`?`). Tracked under `Phase-5e-ext+` on the roadmap.
+  merge keys (`<<:`), YAML 1.1 boolean spellings (`yes`/`no`/`on`/`off`,
+  case-insensitive), block + flow style, Helm `{{ ... }}` tolerated as
+  opaque scalars) and then walks it for rule matches. Remaining gaps:
+  no complex keys (`?`-introduced) or YAML 1.1 sexagesimal/binary
+  integer notations — neither has been seen in real Kubernetes or Helm
+  manifests. Tracked under `Phase-5e-ext+` on the roadmap.
 - **Network behavior of `vulndb update`.** Uses Zig 0.16's
   `std.http.Client`. TLS cert verification is enabled by default; redirect
   handling is the std default. For self-signed feeds, mirror the JSON
