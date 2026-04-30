@@ -14,7 +14,9 @@ const usage =
     \\  scribe sbom <path> [--plain]   bill of materials (CycloneDX 1.5 by default; --plain for human)
     \\  scribe secrets <path> [opts]   SIMD secret scan ([--json] [--include-generic] [--min-entropy N])
     \\  scribe vulns <path> --db <p>   match SBOM components against advisory DB ([--json])
+    \\  scribe config <path> [opts]    audit Dockerfile / k8s manifest ([--type dockerfile|kubernetes] [--json])
     \\  scribe scan <path> [opts]      full pipeline: SBOM + secrets + vulns ([--db p] [--include-generic] [--plain])
+    \\  scribe policy <path> --policy <p>  evaluate scan results against policy ([--db d] [--config c] [--json]); exits 1 on fail
     \\  scribe symbols <path>          DWARF function symbols (ELF only)
     \\  scribe addr2line <path> <hex>  resolve address to source location
     \\  scribe fp generate <path> <lib> [version]    write fingerprint DB to stdout (JSON)
@@ -151,10 +153,33 @@ pub fn main(init: std.process.Init) !void {
         runVulns(io, gpa, stdout, args[2], db, json) catch |err| return dieErr(stderr, err);
         return;
     }
+    if (std.mem.eql(u8, cmd, "config")) {
+        if (args.len < 3) return die(stderr, "error: 'config' requires a path\n", 1);
+        var json = false;
+        var ctype: scribe.security.config.ConfigType = .auto;
+        var idx: usize = 3;
+        while (idx < args.len) : (idx += 1) {
+            const a = args[idx];
+            if (std.mem.eql(u8, a, "--json")) {
+                json = true;
+            } else if (std.mem.eql(u8, a, "--type")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --type requires a value\n", 1);
+                idx += 1;
+                if (std.mem.eql(u8, args[idx], "dockerfile")) ctype = .dockerfile
+                else if (std.mem.eql(u8, args[idx], "kubernetes")) ctype = .kubernetes
+                else return die(stderr, "error: --type must be 'dockerfile' or 'kubernetes'\n", 1);
+            } else {
+                return die(stderr, "error: unknown 'config' option\n", 1);
+            }
+        }
+        runConfig(io, gpa, stdout, args[2], ctype, json) catch |err| return dieErr(stderr, err);
+        return;
+    }
     if (std.mem.eql(u8, cmd, "scan")) {
         if (args.len < 3) return die(stderr, "error: 'scan' requires a path\n", 1);
         var plain = false;
         var db_path: ?[]const u8 = null;
+        var config_path: ?[]const u8 = null;
         var sec_opts: scribe.security.secrets.ScanOptions = .{};
         var idx: usize = 3;
         while (idx < args.len) : (idx += 1) {
@@ -172,12 +197,51 @@ pub fn main(init: std.process.Init) !void {
                 if (idx + 1 >= args.len) return die(stderr, "error: --db requires a path\n", 1);
                 idx += 1;
                 db_path = args[idx];
+            } else if (std.mem.eql(u8, a, "--config")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --config requires a path\n", 1);
+                idx += 1;
+                config_path = args[idx];
             } else {
                 return die(stderr, "error: unknown 'scan' option\n", 1);
             }
         }
-        runScan(io, gpa, stdout, args[2], db_path, sec_opts, plain) catch |err| return dieErr(stderr, err);
+        runScan(io, gpa, stdout, args[2], db_path, config_path, sec_opts, plain) catch |err| return dieErr(stderr, err);
         return;
+    }
+    if (std.mem.eql(u8, cmd, "policy")) {
+        if (args.len < 3) return die(stderr, "error: 'policy' requires a path\n", 1);
+        var json = false;
+        var policy_path: ?[]const u8 = null;
+        var db_path: ?[]const u8 = null;
+        var config_path: ?[]const u8 = null;
+        var sec_opts: scribe.security.secrets.ScanOptions = .{};
+        var idx: usize = 3;
+        while (idx < args.len) : (idx += 1) {
+            const a = args[idx];
+            if (std.mem.eql(u8, a, "--json")) {
+                json = true;
+            } else if (std.mem.eql(u8, a, "--policy")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --policy requires a path\n", 1);
+                idx += 1;
+                policy_path = args[idx];
+            } else if (std.mem.eql(u8, a, "--db")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --db requires a path\n", 1);
+                idx += 1;
+                db_path = args[idx];
+            } else if (std.mem.eql(u8, a, "--config")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --config requires a path\n", 1);
+                idx += 1;
+                config_path = args[idx];
+            } else if (std.mem.eql(u8, a, "--include-generic")) {
+                sec_opts.include_generic = true;
+            } else {
+                return die(stderr, "error: unknown 'policy' option\n", 1);
+            }
+        }
+        const pp = policy_path orelse return die(stderr, "error: 'policy' requires --policy <path>\n", 1);
+        const code = runPolicy(io, gpa, stdout, args[2], pp, db_path, config_path, sec_opts, json) catch |err| return dieErr(stderr, err);
+        stdout.flush() catch {};
+        std.process.exit(code);
     }
 
     try stderr.print("error: unknown command '{s}'\n", .{cmd});
@@ -666,6 +730,7 @@ fn runScan(
     out: *Io.Writer,
     target_path: []const u8,
     db_path: ?[]const u8,
+    config_path: ?[]const u8,
     sec_opts: scribe.security.secrets.ScanOptions,
     plain: bool,
 ) !void {
@@ -696,6 +761,14 @@ fn runScan(
         vulns.items = &.{};
     }
 
+    if (config_path) |cp| {
+        var cfg_map = try scribe.mmap.open(io, cp);
+        defer cfg_map.deinit();
+        var issues = try scribe.security.config.audit(gpa, cfg_map.bytes(), cp, .auto);
+        bom.config_issues = issues.items;
+        issues.items = &.{};
+    }
+
     if (plain) {
         try emitSbom(out, bom, true);
         if (bom.findings.len > 0) {
@@ -722,9 +795,185 @@ fn runScan(
                 );
             }
         }
+        if (bom.config_issues.len > 0) {
+            try out.writeAll("\nconfig issues:\n");
+            for (bom.config_issues) |it| {
+                try out.print(
+                    "  {s:<7}  [{s:<8}]  {s}",
+                    .{ it.rule_id, @tagName(it.severity), it.title },
+                );
+                if (it.line > 0) {
+                    try out.print("  ({s}:{d})\n", .{ it.file, it.line });
+                } else {
+                    try out.print("  ({s})\n", .{it.file});
+                }
+            }
+        }
     } else {
         try scribe.sbom.writeCycloneDX(out, bom);
     }
+}
+
+fn runConfig(
+    io: Io,
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    path: []const u8,
+    ctype: scribe.security.config.ConfigType,
+    json: bool,
+) !void {
+    var mapping = try scribe.mmap.open(io, path);
+    defer mapping.deinit();
+
+    var issues = try scribe.security.config.audit(gpa, mapping.bytes(), path, ctype);
+    defer issues.deinit(gpa);
+
+    if (json) {
+        try emitConfigJson(out, issues);
+    } else {
+        try emitConfigPlain(out, issues);
+    }
+}
+
+fn emitConfigPlain(out: *Io.Writer, issues: scribe.security.config.Issues) !void {
+    if (issues.items.len == 0) {
+        try out.writeAll("(no misconfigurations found)\n");
+        return;
+    }
+    for (issues.items) |it| {
+        try out.print(
+            "{s:<6}  [{s}]  {s}",
+            .{ it.rule_id, @tagName(it.severity), it.title },
+        );
+        if (it.line > 0) {
+            try out.print("  ({s}:{d})", .{ it.file, it.line });
+        } else {
+            try out.print("  ({s})", .{it.file});
+        }
+        try out.writeByte('\n');
+        if (it.snippet.len > 0) try out.print("        > {s}\n", .{it.snippet});
+        if (it.recommendation.len > 0) try out.print("        fix: {s}\n", .{it.recommendation});
+    }
+    try out.print("({d} issues)\n", .{issues.items.len});
+}
+
+fn emitConfigJson(out: *Io.Writer, issues: scribe.security.config.Issues) !void {
+    try out.writeAll("[");
+    for (issues.items, 0..) |it, i| {
+        if (i > 0) try out.writeByte(',');
+        try out.writeAll("\n  {\"rule_id\": ");
+        try writeJsonString(out, it.rule_id);
+        try out.writeAll(", \"title\": ");
+        try writeJsonString(out, it.title);
+        try out.print(
+            ", \"severity\": \"{s}\", \"source\": \"{s}\", \"file\": ",
+            .{ @tagName(it.severity), @tagName(it.source) },
+        );
+        try writeJsonString(out, it.file);
+        if (it.line > 0) try out.print(", \"line\": {d}", .{it.line});
+        if (it.snippet.len > 0) {
+            try out.writeAll(", \"snippet\": ");
+            try writeJsonString(out, it.snippet);
+        }
+        if (it.recommendation.len > 0) {
+            try out.writeAll(", \"recommendation\": ");
+            try writeJsonString(out, it.recommendation);
+        }
+        try out.writeByte('}');
+    }
+    if (issues.items.len > 0) try out.writeByte('\n');
+    try out.writeAll("]\n");
+}
+
+fn runPolicy(
+    io: Io,
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    target_path: []const u8,
+    policy_path: []const u8,
+    db_path: ?[]const u8,
+    config_path: ?[]const u8,
+    sec_opts: scribe.security.secrets.ScanOptions,
+    json: bool,
+) !u8 {
+    var policy_map = try scribe.mmap.open(io, policy_path);
+    defer policy_map.deinit();
+    var policy = try scribe.security.policy.Policy.loadJson(gpa, policy_map.bytes());
+    defer policy.deinit(gpa);
+
+    var target = try scribe.mmap.open(io, target_path);
+    defer target.deinit();
+    const bytes = target.bytes();
+
+    var bom = try scribe.sbom.collect(gpa, bytes);
+    defer bom.deinit(gpa);
+
+    var findings = try scribe.security.secrets.scan(gpa, bytes, sec_opts);
+    bom.findings = findings.items;
+    findings.items = &.{};
+
+    if (db_path) |dp| {
+        var db_map = try scribe.mmap.open(io, dp);
+        defer db_map.deinit();
+        var db = try scribe.security.vulnerability.Database.parseJson(gpa, db_map.bytes());
+        defer db.deinit(gpa);
+        const refs = try gpa.alloc(scribe.security.vulnerability.ComponentRef, bom.components.len);
+        defer gpa.free(refs);
+        for (bom.components, 0..) |c, i| refs[i] = .{ .name = c.name, .version = c.version };
+        var vulns = try scribe.security.vulnerability.match(gpa, refs, db);
+        bom.vulnerabilities = vulns.items;
+        vulns.items = &.{};
+    }
+
+    if (config_path) |cp| {
+        var cfg_map = try scribe.mmap.open(io, cp);
+        defer cfg_map.deinit();
+        var issues = try scribe.security.config.audit(gpa, cfg_map.bytes(), cp, .auto);
+        bom.config_issues = issues.items;
+        issues.items = &.{};
+    }
+
+    var result = try scribe.security.policy.evaluate(gpa, policy, bom);
+    defer result.deinit(gpa);
+
+    if (json) {
+        try emitPolicyJson(out, result);
+    } else {
+        try emitPolicyPlain(out, result);
+    }
+
+    return if (result.verdict == .pass) @as(u8, 0) else @as(u8, 1);
+}
+
+fn emitPolicyPlain(out: *Io.Writer, r: scribe.security.policy.Result) !void {
+    try out.print("verdict: {s}\n", .{@tagName(r.verdict)});
+    if (r.violations.len == 0) return;
+    try out.writeAll("violations:\n");
+    for (r.violations) |v| {
+        try out.print(
+            "  [{s}]  {s}  -> {s}  ({s})\n",
+            .{ @tagName(v.axis), v.rule, v.detail, v.severity_text },
+        );
+    }
+    try out.print("({d} violations)\n", .{r.violations.len});
+}
+
+fn emitPolicyJson(out: *Io.Writer, r: scribe.security.policy.Result) !void {
+    try out.print("{{\n  \"verdict\": \"{s}\",\n  \"violations\": [", .{@tagName(r.verdict)});
+    for (r.violations, 0..) |v, i| {
+        if (i > 0) try out.writeByte(',');
+        try out.writeAll("\n    {\"axis\": \"");
+        try out.writeAll(@tagName(v.axis));
+        try out.writeAll("\", \"rule\": ");
+        try writeJsonString(out, v.rule);
+        try out.writeAll(", \"detail\": ");
+        try writeJsonString(out, v.detail);
+        try out.writeAll(", \"severity\": ");
+        try writeJsonString(out, v.severity_text);
+        try out.writeByte('}');
+    }
+    if (r.violations.len > 0) try out.writeByte('\n');
+    try out.writeAll("  ]\n}\n");
 }
 
 fn writeJsonString(out: *Io.Writer, s: []const u8) !void {

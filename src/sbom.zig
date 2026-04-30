@@ -13,6 +13,7 @@ const buildid_mod = @import("buildid.zig");
 const strings_mod = @import("strings.zig");
 const security_secrets = @import("security/secrets.zig");
 const security_vuln = @import("security/vulnerability.zig");
+const security_config = @import("security/config.zig");
 
 pub const ComponentKind = enum {
     program,
@@ -45,6 +46,8 @@ pub const Sbom = struct {
     findings: []security_secrets.Finding = &.{},
     /// CVE / advisory matches. Empty unless populated by the security pipeline.
     vulnerabilities: []security_vuln.Vulnerability = &.{},
+    /// IaC misconfiguration audit results. Empty unless populated.
+    config_issues: []security_config.Issue = &.{},
 
     pub fn deinit(self: *Sbom, allocator: std.mem.Allocator) void {
         for (self.components) |c| freeComponent(allocator, c);
@@ -53,9 +56,12 @@ pub const Sbom = struct {
         if (self.findings.len != 0) allocator.free(self.findings);
         for (self.vulnerabilities) |v| security_vuln.freeVulnerability(allocator, v);
         if (self.vulnerabilities.len != 0) allocator.free(self.vulnerabilities);
+        for (self.config_issues) |i| security_config.freeIssue(allocator, i);
+        if (self.config_issues.len != 0) allocator.free(self.config_issues);
         self.components = &.{};
         self.findings = &.{};
         self.vulnerabilities = &.{};
+        self.config_issues = &.{};
     }
 };
 
@@ -402,10 +408,12 @@ pub fn writeCycloneDX(writer: *std.Io.Writer, sbom: Sbom) !void {
     }
 
     try writer.writeAll("\n  ]");
-    if (sbom.findings.len > 0) {
+    if (sbom.findings.len > 0 or sbom.config_issues.len > 0) {
         try writer.writeAll(",\n  \"properties\": [");
-        for (sbom.findings, 0..) |f, i| {
-            if (i > 0) try writer.writeByte(',');
+        var first = true;
+        for (sbom.findings) |f| {
+            if (!first) try writer.writeByte(',');
+            first = false;
             try writer.writeAll("\n    {\"name\": \"scribe:secret:");
             try writer.writeAll(@tagName(f.kind));
             try writer.writeAll("\", \"value\": ");
@@ -414,6 +422,27 @@ pub fn writeCycloneDX(writer: *std.Io.Writer, sbom: Sbom) !void {
                 ", \"confidence\": {d}, \"offset\": {d}",
                 .{ @intFromEnum(f.confidence), f.offset },
             );
+            try writer.writeByte('}');
+        }
+        for (sbom.config_issues) |it| {
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.writeAll("\n    {\"name\": \"scribe:config:");
+            try writer.writeAll(@tagName(it.source));
+            try writer.writeByte(':');
+            try writer.writeAll(it.rule_id);
+            try writer.writeAll("\", \"value\": ");
+            try writeJsonString(writer, it.title);
+            try writer.print(
+                ", \"severity\": \"{s}\", \"file\": ",
+                .{@tagName(it.severity)},
+            );
+            try writeJsonString(writer, it.file);
+            if (it.line > 0) try writer.print(", \"line\": {d}", .{it.line});
+            if (it.recommendation.len > 0) {
+                try writer.writeAll(", \"recommendation\": ");
+                try writeJsonString(writer, it.recommendation);
+            }
             try writer.writeByte('}');
         }
         try writer.writeAll("\n  ]");
