@@ -39,17 +39,18 @@ Scribe is a high-performance, cross-platform binary forensics library and CLI wr
 | 3b    | Function-signature fingerprinting (Wyhash, DWARF-keyed)            | done  |
 | 3c    | Container SBOM (docker save tar, layer squash with whiteouts)      | done  |
 | 3d    | Direct OCI registry pull (no docker daemon, multi-arch)            | done  |
-| 4a    | DWARF symbolication                                                | done  |
+| 4a    | DWARF symbolication (ELF)                                          | done  |
+| 4b    | DWARF symbolication (Mach-O `.dSYM`) — symbol enumeration; auto-finds the bundle next to the binary | partial |
 | 5a    | Security: SIMD secret scan (anchored + UTF-16LE + entropy)         | done  |
 | 5b    | Security: vuln matcher (OSV-lite + OSV native + binary `.scvd`)    | done  |
 | 5c    | Security: IaC audit (Dockerfile + Kubernetes + OCI image-config)   | done  |
 | 5d    | Security: policy gate, fingerprint cross-ref, `scribe scan` umbrella | done  |
 | 5e    | Security: vulndb merge, NVD CVE 2.0 ingest, CVSS v2 parser           | done  |
 | 5e-ext | IaC audit driven by an AST YAML walker (multi-doc, anchors/aliases, block + flow style, Helm `{{ ... }}` tolerated) | done |
-| 3b-ext | Sliding-window fingerprint match (stripped binaries) + x86_64 relocation-normalized hashes | done |
+| 3b-ext | Sliding-window fingerprint match (stripped binaries) + x86_64 relocation-normalized hashes (E8/E9/0F8x branches, RIP-relative ModR/M loads/stores/LEAs/indirect calls) | done |
 | 3c-ext | `docker save` cap raised to 8 GiB; env override `SCRIBE_DOCKER_SAVE_CAP_MIB` | partial |
 
-Tests: 141 unit + integration tests (`zig build test`).
+Tests: 146 unit + integration tests (`zig build test`).
 
 ---
 
@@ -241,8 +242,11 @@ Multi-arch manifest lists are resolved against the requested platform.
 
 ### `scribe symbols <path>`
 
-Dumps the DWARF function table of an ELF binary with `.debug_info` /
-`.debug_abbrev` present.
+Dumps the DWARF function table of an ELF binary or a Mach-O whose
+debug info lives in a sibling `.dSYM` bundle (the macOS default after
+`dsymutil`). For Mach-O, scribe first tries DWARF inline; if absent, it
+auto-resolves `<path>.dSYM/Contents/Resources/DWARF/<basename>` and
+parses that. You can also pass the inner Mach-O of the bundle directly.
 
 ```sh
 $ scribe symbols ./myapp | head -5
@@ -252,7 +256,7 @@ $ scribe symbols ./myapp | head -5
 (5185 symbols)
 ```
 
-Mach-O `.dSYM` and PE `.pdb` are not yet supported (Phase-4b/4c — see [Roadmap](#roadmap)).
+PE `.pdb` is still not supported (Phase-4c — see [Roadmap](#roadmap)).
 
 ### `scribe addr2line <path> <hex>`
 
@@ -500,8 +504,8 @@ Registry source:
 | Entry point        | ✓   | ✓ (LC_MAIN) | ✓ (image base + RVA) |
 | Dynamic deps       | ✓ (DT_NEEDED) | ✓ (LC_LOAD_DYLIB) | ✓ (import dir) |
 | Build identifier   | ✓ (`.note.gnu.build-id`) | ✓ (`LC_UUID`) | ✓ (PDB GUID + age) |
-| DWARF symbols      | ✓   | —      | —   |
-| Source line lookup | ✓   | —      | —   |
+| DWARF symbols      | ✓   | ✓ (`.dSYM` auto-resolved) | —   |
+| Source line lookup | ✓   | partial | —   |
 | Strings (SIMD)     | ✓   | ✓      | ✓   |
 | Entropy            | ✓   | ✓      | ✓   |
 | Fingerprint corpus | ✓   | —      | —   |
@@ -544,9 +548,12 @@ Cross-cutting modules: `mmap.zig` (RAII file mapping), `errors.zig` (unified err
 
 ## Caveats and known limitations
 
-- **macOS DWARF**: the symbolicator only consumes ELF `.debug_*` sections.
-  Mach-O typically ships debug info in a separate `.dSYM` bundle, which
-  scribe does not yet parse. Mach-O binaries report `error.NoDebugInfo`.
+- **macOS DWARF**: scribe parses the inner Mach-O of a `.dSYM` bundle
+  (`<bin>.dSYM/Contents/Resources/DWARF/<bin>`) and auto-resolves the
+  bundle when you pass the binary itself. Function-symbol enumeration
+  works; `addr2line` source-line lookup against DWARF 5 line programs
+  trips a `std.debug.Dwarf` upstream bug on the `__debug_line_str` form.
+  Tracked under Phase 4b+.
 - **PE PDB**: scribe extracts the PDB GUID from the debug directory but
   does not (yet) parse the PDB file itself. Address symbolication on PE
   requires the matching `.pdb` and PDB parsing — neither currently
@@ -554,10 +561,13 @@ Cross-cutting modules: `mmap.zig` (RAII file mapping), `errors.zig` (unified err
 - **FAT Mach-O**: universal binaries (FAT magic) return
   `error.UnsupportedClass`. Pre-extract a slice with `lipo -extract` for
   now.
-- **Fingerprint robustness**: function bytes are hashed verbatim. PIC
-  relocations and link-time addresses cause the same source built with
-  different base addresses or against different glibc versions to hash
-  differently. Phase-3b-ext will introduce relocation normalization.
+- **Fingerprint robustness**: each entry carries both a raw Wyhash and a
+  normalized Wyhash. The normalizer zeros the disp32 of E8/E9/0F8x
+  branches and of RIP-relative ModR/M loads/stores/LEAs/indirect-calls
+  before hashing, so the same source built with different relocation
+  targets still matches. The pass is a pattern scan, not a full x86_64
+  length decoder, so it can mis-fire on operand bytes that look like one
+  of those opcodes — see Phase 3b-ext+.
 - **Registry redirect bug**: Zig 0.16.0's `std.http.Client` accepts
   `privileged_headers` but never writes them to the wire. Scribe uses a
   manual redirect path that drops `Authorization` on cross-domain hops to
@@ -577,9 +587,9 @@ YAML for IaC). Open work:
 
 | Phase   | Item                                                                                  |
 | ------- | ------------------------------------------------------------------------------------- |
-| 3b-ext+ | Relocation normalization is **approximate** (linear scan for E8/E9 + cond-jump opcodes; can mis-fire on operand bytes embedded in unrelated instructions). Replacing with a real disassembler-driven pass is the next step; the corpus JSON shape stays the same. |
+| 3b-ext+ | Relocation normalization is still a pattern scan (E8/E9 + cond-jump + RIP-relative ModR/M across a curated set of common opcodes), not a full length decoder. It will mis-fire when one of those opcode bytes happens to appear inside another instruction's operand. Replacing with a real disassembler-driven pass is the next step; the corpus JSON shape stays the same. |
 | 3c-ext+ | True streaming `docker save` ingestion. Today's 8 GiB in-memory cap is configurable via `SCRIBE_DOCKER_SAVE_CAP_MIB` but the full tar is still buffered. Genuine streaming requires `container.collect` to take a `Reader` instead of `[]const u8` — the squash walk has forward references between manifest.json and layer blobs, so the refactor is non-trivial. |
-| 4b      | Mach-O `.dSYM` symbolication (parse the bundle's inner Mach-O DWARF, generalize `dwarf.zig` past ELF section names). |
+| 4b+     | Mach-O `.dSYM` symbol enumeration ships and the CLI auto-resolves `<bin>.dSYM/...`. Source-line lookup currently bails on `error.InvalidDebugInfo` for DWARF 5 line programs whose file-name forms reference `__debug_line_str`; this is in `std.debug.Dwarf`'s line-program decoder, not in scribe — once the upstream path lands, `addr2line` will start working with no scribe-side change. |
 | 4c      | PE PDB parsing — scribe extracts the PDB GUID from the debug directory, but std.zig has no PDB parser. Multi-week port from the LLVM/MSF reverse-engineered docs. |
 | 5e-ext+ | YAML parser is a deliberate 1.2 subset — no merge keys (`<<:`), no YAML 1.1 booleans (`yes`/`no`/`on`/`off`), no complex keys (`?`). Covers every k8s manifest shape we've audited; widening to full 1.2 is on the table if real users hit it. |
 | 6       | Function-flow CFG construction, anti-tampering checks, yara-style rule integration — research direction; deeper static analysis as a foundation for `scribe-live` correlation. |

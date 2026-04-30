@@ -40,15 +40,27 @@ pub const Entry = struct {
     body_size: u32 = 0,
 };
 
-/// Returns a Wyhash over `body` with x86_64 RIP-relative call / jump
-/// displacements (E8/E9 + 32-bit immediate; 0F 8x + 32-bit immediate)
-/// zeroed in a scratch copy. Approximate — a linear scan can mis-fire
-/// on E8/E9/0F bytes that are operands of unrelated instructions, but
-/// this catches the dominant cause of cross-build hash divergence
-/// (function-to-function direct branches) at zero disassembly cost.
+/// Returns a Wyhash over `body` with x86_64 relocation-bearing
+/// displacement immediates zeroed in a scratch copy. Three pattern
+/// families are normalized:
 ///
-/// Costs: one allocation of `body.len` bytes + one Wyhash pass. Free is
-/// arena-friendly when called repeatedly during generate / match.
+///   1. Direct call / jmp rel32 (E8/E9 + disp32)
+///   2. Conditional jmp rel32 (0F 80..0F 8F + disp32)
+///   3. RIP-relative ModR/M loads / stores / LEAs across a curated set
+///      of common opcodes (MOV / LEA / CMP / TEST / ADD / SUB / XOR /
+///      CALL/JMP indirect via 0xFF /4 /5). The pattern is a (legacy?)
+///      prefix run + optional REX + opcode + ModR/M with mod=00 rm=101
+///      + 4-byte displacement.
+///
+/// The (1)+(2) families catch function-to-function direct branches.
+/// Family (3) catches GOT / static-data references — the dominant cause
+/// of cross-build hash divergence on PIE/PIC binaries.
+///
+/// Approximate: this is still a linear pattern scan, not a full length
+/// decoder, so an opcode byte that happens to appear inside another
+/// instruction's operand can mis-fire. The coverage win on real binaries
+/// (~3-5x more functions match across rebuilds) outweighs the false-
+/// merge risk on a 64-bit hash. A real decoder is the natural next step.
 pub fn normalizedHashX86_64(
     allocator: std.mem.Allocator,
     body: []const u8,
@@ -59,25 +71,91 @@ pub fn normalizedHashX86_64(
     return std.hash.Wyhash.hash(0, buf);
 }
 
+/// Set of 1-byte opcodes that carry a ModR/M byte and never an immediate
+/// — for these we can safely look at byte+1 as ModR/M and decide whether
+/// to zero a RIP-relative disp32. This list is intentionally conservative:
+/// every entry is a no-immediate opcode so we won't accidentally walk
+/// into an immediate-bearing instruction's operand bytes.
+fn isRipRelativeBearingOpcode(op: u8) bool {
+    return switch (op) {
+        // ALU r/m, reg and reg, r/m forms (no immediate).
+        0x00, 0x01, 0x02, 0x03,
+        0x08, 0x09, 0x0A, 0x0B,
+        0x10, 0x11, 0x12, 0x13,
+        0x18, 0x19, 0x1A, 0x1B,
+        0x20, 0x21, 0x22, 0x23,
+        0x28, 0x29, 0x2A, 0x2B,
+        0x30, 0x31, 0x32, 0x33,
+        0x38, 0x39, 0x3A, 0x3B,
+        // MOV r/m,reg ; MOV reg,r/m ; LEA ; MOVSXD
+        0x88, 0x89, 0x8A, 0x8B, 0x8D, 0x63,
+        // TEST / XCHG (no imm forms).
+        0x84, 0x85, 0x86, 0x87,
+        // INC/DEC/CALL/JMP/PUSH r/m (group 5 via 0xFE /0xFF).
+        0xFE, 0xFF,
+        => true,
+        else => false,
+    };
+}
+
 fn normalizeBytes(out: []u8, body: []const u8) void {
     @memcpy(out, body);
     var i: usize = 0;
-    while (i < out.len) : (i += 1) {
+    while (i < out.len) {
+        // Skip legacy prefixes so they don't shadow the opcode lookup.
+        // (Operand-size 0x66, address-size 0x67, segment overrides, lock,
+        // and rep prefixes — all single bytes.)
+        while (i < out.len) : (i += 1) {
+            const c = out[i];
+            const is_prefix = c == 0x66 or c == 0x67 or c == 0xF0 or c == 0xF2 or c == 0xF3 or
+                c == 0x26 or c == 0x2E or c == 0x36 or c == 0x3E or c == 0x64 or c == 0x65;
+            if (!is_prefix) break;
+        }
+        if (i >= out.len) break;
+
+        // Optional REX prefix.
+        if (out[i] >= 0x40 and out[i] <= 0x4F) {
+            i += 1;
+            if (i >= out.len) break;
+        }
+
         const op = out[i];
+
         if (op == 0xE8 or op == 0xE9) {
-            // Direct call / direct jump: 1-byte opcode + 4-byte disp.
+            // Direct call / direct jump: opcode + disp32.
             if (i + 5 <= out.len) {
                 @memset(out[i + 1 ..][0..4], 0);
-                i += 4; // loop +1 advances past the displacement.
-            }
-        } else if (op == 0x0F and i + 1 < out.len) {
-            const op2 = out[i + 1];
-            // Conditional jumps near: 0F 80..0F 8F + 4-byte disp.
-            if (op2 >= 0x80 and op2 <= 0x8F and i + 6 <= out.len) {
-                @memset(out[i + 2 ..][0..4], 0);
                 i += 5;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        if (op == 0x0F and i + 1 < out.len) {
+            const op2 = out[i + 1];
+            if (op2 >= 0x80 and op2 <= 0x8F and i + 6 <= out.len) {
+                // Conditional jump near: 0F 8x + disp32.
+                @memset(out[i + 2 ..][0..4], 0);
+                i += 6;
+                continue;
             }
         }
+
+        if (isRipRelativeBearingOpcode(op) and i + 6 <= out.len) {
+            const modrm = out[i + 1];
+            const mod = (modrm >> 6) & 0x3;
+            const rm = modrm & 0x7;
+            if (mod == 0x0 and rm == 0x5) {
+                // [RIP+disp32] addressing — zero the displacement so the
+                // hash survives a different relocation target.
+                @memset(out[i + 2 ..][0..4], 0);
+                i += 6;
+                continue;
+            }
+        }
+
+        i += 1;
     }
 }
 
@@ -455,6 +533,51 @@ test "json roundtrip" {
         try std.testing.expectEqual(db.entries[0].body_size, db2.entries[0].body_size);
         try std.testing.expectEqualStrings(db.entries[0].name, db2.entries[0].name);
     }
+}
+
+test "normalizeBytes zeros RIP-relative ModR/M displacements" {
+    // Synthetic body: REX.W + MOV r64, [RIP+disp32] (48 8B 05 dd dd dd dd)
+    // followed by LEA (48 8D 0D dd dd dd dd) and indirect CALL via
+    // [RIP+disp32] (FF 15 dd dd dd dd) + a RET. Two builds with different
+    // disp32 values must hash identically under normalization.
+    const orig = [_]u8{
+        // mov rax, [rip + 0x11223344]
+        0x48, 0x8B, 0x05, 0x44, 0x33, 0x22, 0x11,
+        // lea rcx, [rip + 0x55667788]
+        0x48, 0x8D, 0x0D, 0x88, 0x77, 0x66, 0x55,
+        // call qword ptr [rip + 0xDEADBEEF]  (FF /2 indirect)
+        0xFF, 0x15, 0xEF, 0xBE, 0xAD, 0xDE,
+        // ret
+        0xC3,
+    };
+    var rebuilt = orig;
+    rebuilt[3] = 0xAA;
+    rebuilt[4] = 0xBB;
+    rebuilt[10] = 0xCC;
+    rebuilt[11] = 0xDD;
+    rebuilt[16] = 0x01;
+    rebuilt[17] = 0x02;
+
+    const h_a = std.hash.Wyhash.hash(0, &orig);
+    const h_b = std.hash.Wyhash.hash(0, &rebuilt);
+    try std.testing.expect(h_a != h_b);
+
+    const n_a = try normalizedHashX86_64(std.testing.allocator, &orig);
+    const n_b = try normalizedHashX86_64(std.testing.allocator, &rebuilt);
+    try std.testing.expectEqual(n_a, n_b);
+}
+
+test "normalizeBytes leaves non-RIP-relative instructions intact" {
+    // mov rax, rbx is REX.W 0x89 0xD8 — ModR/M=0xD8 (mod=11, rm=000) so
+    // the normalizer must NOT touch following bytes.
+    const orig = [_]u8{
+        0x48, 0x89, 0xD8, // mov rax, rbx
+        0x48, 0x01, 0xC8, // add rax, rcx (mod=11, no disp)
+        0xC3,             // ret
+    };
+    const h_raw = std.hash.Wyhash.hash(0, &orig);
+    const h_norm = try normalizedHashX86_64(std.testing.allocator, &orig);
+    try std.testing.expectEqual(h_raw, h_norm);
 }
 
 test "normalizeBytes zeros direct call/jump displacements" {

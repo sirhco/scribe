@@ -21,7 +21,7 @@ const usage =
     \\  scribe vulndb compile <in.json|-> <out.scvd>    compile JSON advisory DB to mmap-friendly binary (.scvd)
     \\  scribe vulndb merge <out.scvd> <in1> [in2...]   merge multiple .scvd or JSON advisory DBs into one
     \\  scribe vulndb update --from <url> --out <p>     fetch advisory JSON over HTTPS, compile to .scvd
-    \\  scribe symbols <path>          DWARF function symbols (ELF only)
+    \\  scribe symbols <path>          DWARF function symbols (ELF or Mach-O dSYM)
     \\  scribe addr2line <path> <hex>  resolve address to source location
     \\  scribe fp generate <path> <lib> [version]    write fingerprint DB to stdout (JSON)
     \\  scribe fp match <path> <db.json>             match fns in <path> against DB
@@ -527,6 +527,18 @@ fn stripHexPrefix(s: []const u8) []const u8 {
     return s;
 }
 
+/// Build the conventional `.dSYM` companion path for a Mach-O binary:
+/// `<bin>.dSYM/Contents/Resources/DWARF/<basename>`. Returns null when the
+/// constructed path wouldn't fit in `buf` (filename too long).
+fn dsymCandidate(bin_path: []const u8, buf: []u8) ?[]const u8 {
+    const base = std.fs.path.basename(bin_path);
+    return std.fmt.bufPrint(
+        buf,
+        "{s}.dSYM/Contents/Resources/DWARF/{s}",
+        .{ bin_path, base },
+    ) catch null;
+}
+
 fn runSymbols(
     io: Io,
     gpa: std.mem.Allocator,
@@ -536,7 +548,23 @@ fn runSymbols(
     var mapping = try scribe.mmap.open(io, path);
     defer mapping.deinit();
 
-    var sym = try scribe.dwarf.open(gpa, mapping.bytes());
+    var dsym_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dsym_mapping_opt: ?scribe.mmap.Mapping = null;
+    defer if (dsym_mapping_opt) |*m| m.deinit();
+
+    var sym = scribe.dwarf.open(gpa, mapping.bytes()) catch |err| switch (err) {
+        error.NoDebugInfo => blk: {
+            // For Mach-O, fall back to a sibling `.dSYM` bundle (the macOS
+            // toolchain default — debug info lives there, not in the
+            // binary). For ELF/PE, no fallback path; rethrow.
+            if (dsymCandidate(path, &dsym_path_buf)) |candidate| {
+                dsym_mapping_opt = scribe.mmap.open(io, candidate) catch return err;
+                break :blk try scribe.dwarf.open(gpa, dsym_mapping_opt.?.bytes());
+            }
+            return err;
+        },
+        else => return err,
+    };
     defer sym.deinit(gpa);
 
     const Ctx = struct {
@@ -573,7 +601,20 @@ fn runAddr2Line(
     var mapping = try scribe.mmap.open(io, path);
     defer mapping.deinit();
 
-    var sym = try scribe.dwarf.open(gpa, mapping.bytes());
+    var dsym_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dsym_mapping_opt: ?scribe.mmap.Mapping = null;
+    defer if (dsym_mapping_opt) |*m| m.deinit();
+
+    var sym = scribe.dwarf.open(gpa, mapping.bytes()) catch |err| switch (err) {
+        error.NoDebugInfo => blk: {
+            if (dsymCandidate(path, &dsym_path_buf)) |candidate| {
+                dsym_mapping_opt = scribe.mmap.open(io, candidate) catch return err;
+                break :blk try scribe.dwarf.open(gpa, dsym_mapping_opt.?.bytes());
+            }
+            return err;
+        },
+        else => return err,
+    };
     defer sym.deinit(gpa);
 
     const name = sym.addressToSymbol(addr);
