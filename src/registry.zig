@@ -114,7 +114,7 @@ pub fn pullSbom(
     defer im.deinit();
 
     // Step 5: fetch config + layer blobs into a map.
-    var blobs: std.StringHashMap([]u8) = .init(work);
+    var blobs: std.StringHashMap([]const u8) = .init(work);
     {
         const config_path = try std.fmt.allocPrint(work, "blobs/{s}", .{im.value.config.digest});
         const config_bytes = try fetchBlob(work, &client, ref, im.value.config.digest, token, options.max_blob_bytes);

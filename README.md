@@ -48,7 +48,7 @@ Scribe is a high-performance, cross-platform binary forensics library and CLI wr
 | 5e    | Security: vulndb merge, NVD CVE 2.0 ingest, CVSS v2 parser           | done  |
 | 5e-ext | IaC audit driven by an AST YAML walker (multi-doc, anchors/aliases, block + flow style, Helm `{{ ... }}` tolerated) | done |
 | 3b-ext | Sliding-window fingerprint match (stripped binaries) + x86_64 relocation-normalized hashes (E8/E9/0F8x branches, RIP-relative ModR/M loads/stores/LEAs/indirect calls) | done |
-| 3c-ext | `docker save` cap raised to 8 GiB; env override `SCRIBE_DOCKER_SAVE_CAP_MIB` | partial |
+| 3c-ext | `docker save` stdout spooled straight to a tempfile (no in-memory cap); outer-tar walk is zero-copy via mmap so resident memory tracks the working set, not the image size | done |
 
 Tests: 146 unit + integration tests (`zig build test`).
 
@@ -474,11 +474,13 @@ Container source detection:
 Local docker source (`docker://`):
 
 - Requires `docker` CLI on `PATH` and a running daemon.
-- Spawns `docker save <image>` and buffers stdout into memory before
-  walking. Works for any image in the daemon's local store, including
-  ones never pushed to a registry.
-- Memory cap: stdout is bounded at 2 GiB by default. Stream-mode (no
-  buffering) is on the Phase-3c-ext list.
+- Spawns `docker save <image>` and redirects stdout straight to a
+  tempfile under `/tmp` via `StdIo.file`. Works for any image in the
+  daemon's local store, including ones never pushed to a registry.
+- Memory: tar is mmap'd from disk and walked zero-copy, so resident
+  memory tracks the working set (manifest + one decompressed layer at a
+  time) rather than the image size. The legacy
+  `SCRIBE_DOCKER_SAVE_CAP_MIB` knob no longer applies.
 - `docker://<image>[:<tag>]`. Tag defaults to whatever docker resolves
   (typically `latest`). Use full repo names for non-Hub local images
   (e.g. `docker://my-org/svc:dev`).
@@ -588,7 +590,7 @@ YAML for IaC). Open work:
 | Phase   | Item                                                                                  |
 | ------- | ------------------------------------------------------------------------------------- |
 | 3b-ext+ | Relocation normalization is still a pattern scan (E8/E9 + cond-jump + RIP-relative ModR/M across a curated set of common opcodes), not a full length decoder. It will mis-fire when one of those opcode bytes happens to appear inside another instruction's operand. Replacing with a real disassembler-driven pass is the next step; the corpus JSON shape stays the same. |
-| 3c-ext+ | True streaming `docker save` ingestion. Today's 8 GiB in-memory cap is configurable via `SCRIBE_DOCKER_SAVE_CAP_MIB` but the full tar is still buffered. Genuine streaming requires `container.collect` to take a `Reader` instead of `[]const u8` — the squash walk has forward references between manifest.json and layer blobs, so the refactor is non-trivial. |
+| 3c-ext+ | The full `docker save` tar is now spooled to a tempfile and walked via mmap rather than copied through the heap (the previous 8 GiB RAM cap is gone). True single-pass streaming from a `Reader` would still be a refactor of `container.collect` itself, since manifest.json forward-references layer blobs that may appear later in the stream — the spool-and-mmap path delivers the same memory savings without that surgery. |
 | 4b+     | Mach-O `.dSYM` symbol enumeration ships and the CLI auto-resolves `<bin>.dSYM/...`. Source-line lookup currently bails on `error.InvalidDebugInfo` for DWARF 5 line programs whose file-name forms reference `__debug_line_str`; this is in `std.debug.Dwarf`'s line-program decoder, not in scribe — once the upstream path lands, `addr2line` will start working with no scribe-side change. |
 | 4c      | PE PDB parsing — scribe extracts the PDB GUID from the debug directory, but std.zig has no PDB parser. Multi-week port from the LLVM/MSF reverse-engineered docs. |
 | 5e-ext+ | YAML parser is a deliberate 1.2 subset — no merge keys (`<<:`), no YAML 1.1 booleans (`yes`/`no`/`on`/`off`), no complex keys (`?`). Covers every k8s manifest shape we've audited; widening to full 1.2 is on the table if real users hit it. |

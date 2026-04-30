@@ -6,20 +6,18 @@
 //! `docker` CLI on PATH, but it works for any image already in the daemon's
 //! image store — including locally-built images that have never been pushed.
 //!
-//! Memory: the entire `docker save` output is buffered in memory before
-//! being walked. Default cap is 8 GiB (raised from 2 GiB) which covers
-//! every reasonable image; can be tightened with the SCRIBE_DOCKER_SAVE_CAP
-//! env var (value in MiB).
-//!
-//! True streaming requires a container.collect refactor — the OCI tar
-//! has forward references (manifest.json points at layer blobs that may
-//! appear later in the stream), so a single-pass walker can't construct
-//! the squash without buffering. That refactor is out of scope here; the
-//! 8 GiB cap is the practical compromise for v1.
+//! Memory: `docker save` stdout is redirected straight to a tempfile via
+//! `std.process.spawn` + `StdIo.file` rather than buffered into the parent's
+//! heap. Once the child exits the tempfile is mmap'd and `container.collect`
+//! walks it zero-copy. Resident memory is bounded by the working set of the
+//! squash + decompressed-layer-at-a-time, regardless of image size; the
+//! image just lives on disk for a moment. The legacy in-memory cap (and its
+//! `SCRIBE_DOCKER_SAVE_CAP_MIB` override) no longer applies.
 
 const std = @import("std");
 const errors = @import("errors.zig");
 const container = @import("container.zig");
+const mmap_mod = @import("mmap.zig");
 
 pub const Error = error{
     DockerNotInstalled,
@@ -37,21 +35,6 @@ pub fn parseImage(uri: []const u8) []const u8 {
     return uri;
 }
 
-/// Buffer cap for `docker save` stdout. Override by setting
-/// SCRIBE_DOCKER_SAVE_CAP_MIB to the desired megabyte value.
-const default_stdout_cap: usize = 8 * 1024 * 1024 * 1024;
-
-fn stdoutCap(environ: ?std.process.Environ) usize {
-    if (environ) |e| {
-        if (e.getPosix("SCRIBE_DOCKER_SAVE_CAP_MIB")) |v| {
-            const trimmed = std.mem.trim(u8, v, " \t\n\r");
-            const mib = std.fmt.parseInt(usize, trimmed, 10) catch return default_stdout_cap;
-            return mib * 1024 * 1024;
-        }
-    }
-    return default_stdout_cap;
-}
-
 pub fn pullSbom(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -60,58 +43,82 @@ pub fn pullSbom(
     return pullSbomWithEnv(gpa, io, uri, null);
 }
 
-/// Variant that lets the caller pass an `Environ` for env-var lookup.
-/// Plain `pullSbom` skips the env override and always uses the default cap.
+/// Compatibility shim — the env override is no longer consulted now that
+/// stdout goes straight to a tempfile, but the signature is preserved for
+/// existing callers / tests.
 pub fn pullSbomWithEnv(
     gpa: std.mem.Allocator,
     io: std.Io,
     uri: []const u8,
     environ: ?std.process.Environ,
 ) Error!container.ImageSbom {
+    _ = environ;
     const image = parseImage(uri);
 
-    const cap = stdoutCap(environ);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = buildTempPath(&path_buf) catch return error.SystemResources;
+
+    var out_file = std.Io.Dir.createFileAbsolute(io, tmp_path, .{
+        .read = true,
+        .truncate = true,
+    }) catch return error.SystemResources;
+    // Always unlink — mmap below holds the inode open, so deleting the
+    // pathname doesn't free the bytes until we drop the mapping.
+    defer std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
+
     const argv = [_][]const u8{ "docker", "save", image };
-    const result = std.process.run(gpa, io, .{
+    var child = std.process.spawn(io, .{
         .argv = &argv,
-        .stdout_limit = .limited(cap),
-        .stderr_limit = .limited(64 * 1024),
-        .reserve_amount = 1 * 1024 * 1024,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return error.DockerNotInstalled,
-        error.StreamTooLong => return error.StreamTooLong,
-        else => |e| {
-            std.log.warn("docker save spawn failed: {s}", .{@errorName(e)});
-            return error.DockerSaveFailed;
-        },
+        .stdin = .ignore,
+        .stdout = .{ .file = out_file },
+        .stderr = .inherit,
+    }) catch |err| {
+        out_file.close(io);
+        switch (err) {
+            error.FileNotFound => return error.DockerNotInstalled,
+            else => {
+                std.log.warn("docker save spawn failed: {s}", .{@errorName(err)});
+                return error.DockerSaveFailed;
+            },
+        }
     };
-    defer gpa.free(result.stderr);
-    errdefer gpa.free(result.stdout);
+    // Parent's copy of the stdout fd is no longer needed; the child has its
+    // own. Closing here means the inode's only writer becomes the child, so
+    // when the child exits the file's contents are final.
+    out_file.close(io);
+    errdefer child.kill(io);
 
-    switch (result.term) {
+    const term = child.wait(io) catch return error.DockerSaveFailed;
+    switch (term) {
         .exited => |code| if (code != 0) {
-            std.log.warn("docker save '{s}' exited {d}: {s}", .{
-                image,
-                code,
-                result.stderr,
-            });
-            gpa.free(result.stdout);
+            std.log.warn("docker save '{s}' exited {d}", .{ image, code });
             return error.DockerSaveFailed;
         },
-        else => {
-            gpa.free(result.stdout);
-            return error.DockerSaveFailed;
-        },
+        else => return error.DockerSaveFailed,
     }
 
-    if (result.stdout.len == 0) {
-        gpa.free(result.stdout);
-        return error.DockerSaveFailed;
-    }
+    var mapping = mmap_mod.open(io, tmp_path) catch |err| switch (err) {
+        error.EmptyFile => return error.DockerSaveFailed,
+        else => return error.DockerSaveFailed,
+    };
+    defer mapping.deinit();
 
-    const sbom = try container.collect(gpa, result.stdout);
-    gpa.free(result.stdout);
-    return sbom;
+    return try container.collect(gpa, mapping.bytes());
+}
+
+/// Process-local counter so multiple `pullSbom` calls in the same PID
+/// don't collide on the tempfile path.
+var tempfile_counter = std.atomic.Value(u64).init(0);
+
+/// Build a unique tempfile path under `/tmp`. The PID makes paths unique
+/// across concurrent scribes on the same host; a process-local counter
+/// covers repeat calls within a single scribe run. Sticking to `/tmp`
+/// keeps this POSIX-only path simple — the docker-save flow already
+/// requires a POSIX docker daemon anyway.
+fn buildTempPath(buf: []u8) ![]const u8 {
+    const pid = std.posix.system.getpid();
+    const seq = tempfile_counter.fetchAdd(1, .monotonic);
+    return std.fmt.bufPrint(buf, "/tmp/scribe-docker-save-{d}-{d}.tar", .{ pid, seq });
 }
 
 test "parseImage strips docker:// scheme" {

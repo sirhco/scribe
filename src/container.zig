@@ -61,13 +61,14 @@ pub fn collect(allocator: std.mem.Allocator, tar_bytes: []const u8) Error!ImageS
 }
 
 /// Lower-level entry point: caller provides a {path -> bytes} map containing
-/// `manifest.json`, the config blob(s), and the layer blob(s). Used by the
-/// docker-save path (caller built the map by walking a tar) and the
-/// registry-pull path (caller built the map from HTTP responses).
+/// `manifest.json`, the config blob(s), and the layer blob(s). Values are
+/// borrowed `[]const u8` slices — typically into a memory-mapped tar
+/// (docker-save path) or an HTTP response buffer (registry-pull path) —
+/// and must outlive this call.
 pub fn collectFromBlobs(
     allocator: std.mem.Allocator,
     work: std.mem.Allocator,
-    outer: std.StringHashMap([]u8),
+    outer: std.StringHashMap([]const u8),
 ) Error!ImageSbom {
     const manifest_raw = outer.get("manifest.json") orelse return error.ManifestMissing;
     const parsed = json.parseFromSlice(
@@ -107,7 +108,7 @@ pub fn collectFromBlobs(
             img_issues.items = &.{};
         }
 
-        var squash: std.StringHashMap([]u8) = .init(work);
+        var squash: std.StringHashMap([]const u8) = .init(work);
         for (entry.Layers) |layer_path| {
             const layer_bytes = outer.get(layer_path) orelse return error.LayerMissing;
             applyLayer(work, &squash, layer_bytes) catch continue;
@@ -179,7 +180,7 @@ const ConfigDoc = struct {
 
 fn readPlatform(
     work: std.mem.Allocator,
-    outer: std.StringHashMap([]u8),
+    outer: std.StringHashMap([]const u8),
     config_path: []const u8,
 ) ![]u8 {
     const config_bytes = outer.get(config_path) orelse return error.ConfigMissing;
@@ -196,19 +197,45 @@ fn readPlatform(
     return std.fmt.allocPrint(work, "{s}/{s}", .{ os, arch });
 }
 
+/// Walk the outer `docker save` tar and produce a {path → bytes} map
+/// where values are zero-copy slices into `bytes`. Caller must keep
+/// `bytes` alive for the lifetime of the map.
 fn readTarToMap(
     allocator: std.mem.Allocator,
     bytes: []const u8,
-) !std.StringHashMap([]u8) {
-    var map: std.StringHashMap([]u8) = .init(allocator);
+) !std.StringHashMap([]const u8) {
+    var map: std.StringHashMap([]const u8) = .init(allocator);
     var input: Io.Reader = .fixed(bytes);
-    try walkTar(allocator, &input, &map);
+
+    var name_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var it = tar.Iterator.init(&input, .{
+        .file_name_buffer = &name_buf,
+        .link_name_buffer = &link_buf,
+    });
+    var scratch: [4096]u8 = undefined;
+    var dump = Io.Writer.Discarding.init(&scratch);
+
+    while (try it.next()) |file| {
+        if (file.kind != .file) continue;
+        const start = input.seek;
+        const sz: usize = @intCast(file.size);
+        if (start + sz > bytes.len) return error.InvalidManifest;
+        const slice = bytes[start .. start + sz];
+        // streamRemaining advances the reader past the file content (and
+        // tar padding) so the next call to `it.next()` sees the right
+        // header. Routing the bytes to `Discarding` keeps the slice valid
+        // without a copy.
+        try it.streamRemaining(file, &dump.writer);
+        const key = try allocator.dupe(u8, file.name);
+        try map.put(key, slice);
+    }
     return map;
 }
 
 fn applyLayer(
     allocator: std.mem.Allocator,
-    squash: *std.StringHashMap([]u8),
+    squash: *std.StringHashMap([]const u8),
     layer_bytes: []const u8,
 ) !void {
     const is_gzip = layer_bytes.len >= 2 and layer_bytes[0] == 0x1F and layer_bytes[1] == 0x8B;
@@ -220,35 +247,15 @@ fn applyLayer(
         var dz = flate.Decompress.init(&input, .gzip, window);
         try walkTarApplying(allocator, &dz.reader, squash);
     } else {
-        try walkTarApplying(allocator, &input, squash);
-    }
-}
-
-fn walkTar(
-    allocator: std.mem.Allocator,
-    reader: *Io.Reader,
-    map: *std.StringHashMap([]u8),
-) !void {
-    var name_buf: [std.fs.max_path_bytes]u8 = undefined;
-    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    var it = tar.Iterator.init(reader, .{
-        .file_name_buffer = &name_buf,
-        .link_name_buffer = &link_buf,
-    });
-    while (try it.next()) |file| {
-        if (file.kind != .file) continue; // Iterator skips padding on next()
-        const buf = try allocator.alloc(u8, @intCast(file.size));
-        var w: Io.Writer = .fixed(buf);
-        try it.streamRemaining(file, &w);
-        const key = try allocator.dupe(u8, file.name);
-        try map.put(key, buf);
+        // Raw (uncompressed) layer: zero-copy slice into the outer tar.
+        try walkTarApplyingZeroCopy(allocator, layer_bytes, squash);
     }
 }
 
 fn walkTarApplying(
     allocator: std.mem.Allocator,
     reader: *Io.Reader,
-    squash: *std.StringHashMap([]u8),
+    squash: *std.StringHashMap([]const u8),
 ) !void {
     var name_buf: [std.fs.max_path_bytes]u8 = undefined;
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -276,6 +283,44 @@ fn walkTarApplying(
     }
 }
 
+/// Zero-copy variant of `walkTarApplying` for raw (uncompressed) layers.
+/// File bodies are sliced directly out of the layer's underlying bytes
+/// rather than copied into fresh allocations.
+fn walkTarApplyingZeroCopy(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    squash: *std.StringHashMap([]const u8),
+) !void {
+    var input: Io.Reader = .fixed(bytes);
+    var name_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var it = tar.Iterator.init(&input, .{
+        .file_name_buffer = &name_buf,
+        .link_name_buffer = &link_buf,
+    });
+    var scratch: [4096]u8 = undefined;
+    var dump = Io.Writer.Discarding.init(&scratch);
+    while (try it.next()) |file| {
+        const norm = stripDotSlash(file.name);
+
+        if (isWhiteout(norm)) |target| {
+            removeFromSquash(squash, target);
+            continue;
+        }
+
+        if (file.kind != .file) continue;
+
+        const start = input.seek;
+        const sz: usize = @intCast(file.size);
+        if (start + sz > bytes.len) return error.InvalidManifest;
+        const slice = bytes[start .. start + sz];
+        try it.streamRemaining(file, &dump.writer);
+
+        const key = try allocator.dupe(u8, norm);
+        try squash.put(key, slice);
+    }
+}
+
 fn stripDotSlash(name: []const u8) []const u8 {
     if (std.mem.startsWith(u8, name, "./")) return name[2..];
     return name;
@@ -291,7 +336,7 @@ fn isWhiteout(path: []const u8) ?[]const u8 {
     return base[4..];
 }
 
-fn removeFromSquash(squash: *std.StringHashMap([]u8), target_basename: []const u8) void {
+fn removeFromSquash(squash: *std.StringHashMap([]const u8), target_basename: []const u8) void {
     // Linear scan: remove any path whose basename matches.
     var to_remove: [16][]const u8 = undefined;
     var n: usize = 0;
