@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const scribe = @import("scribe");
+const ui = @import("ui.zig");
 
 const usage =
     \\scribe — binary forensics
@@ -25,6 +26,8 @@ const usage =
     \\  scribe addr2line <path> <hex>  resolve address to source location
     \\  scribe fp generate <path> <lib> [version]    write fingerprint DB to stdout (JSON)
     \\  scribe fp match <path> <db.json>             match fns in <path> against DB
+    \\  scribe ui <source> [opts]      interactive scan-results browser (TUI)
+    \\                                 ([--db p] [--config p] [--fp-db p] [--include-generic] [--include-wide])
     \\
     \\Sources for `sbom`:
     \\  - local file path                                       (binary or docker save tar)
@@ -278,6 +281,46 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
         return die(stderr, "error: vulndb <compile|update>\n", 1);
+    }
+    if (std.mem.eql(u8, cmd, "ui")) {
+        if (args.len < 3) return die(stderr, "error: 'ui' requires a path\n", 1);
+        var db_path: ?[]const u8 = null;
+        var config_path: ?[]const u8 = null;
+        var fp_db_path: ?[]const u8 = null;
+        var sec_opts: scribe.security.secrets.ScanOptions = .{};
+        var idx: usize = 3;
+        while (idx < args.len) : (idx += 1) {
+            const a = args[idx];
+            if (std.mem.eql(u8, a, "--include-generic")) {
+                sec_opts.include_generic = true;
+            } else if (std.mem.eql(u8, a, "--include-wide")) {
+                sec_opts.scan_wide = true;
+            } else if (std.mem.eql(u8, a, "--db")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --db requires a path\n", 1);
+                idx += 1;
+                db_path = args[idx];
+            } else if (std.mem.eql(u8, a, "--config")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --config requires a path\n", 1);
+                idx += 1;
+                config_path = args[idx];
+            } else if (std.mem.eql(u8, a, "--fp-db")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --fp-db requires a path\n", 1);
+                idx += 1;
+                fp_db_path = args[idx];
+            } else {
+                return die(stderr, "error: unknown 'ui' option\n", 1);
+            }
+        }
+        ui.run(io, gpa, init.environ_map, args[2], .{
+            .db_path = db_path,
+            .config_path = config_path,
+            .fp_db_path = fp_db_path,
+            .sec_opts = sec_opts,
+        }, &prog) catch |err| {
+            prog.fail(@errorName(err));
+            return dieErr(stderr, err);
+        };
+        return;
     }
     if (std.mem.eql(u8, cmd, "policy")) {
         if (args.len < 3) return die(stderr, "error: 'policy' requires a path\n", 1);
