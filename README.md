@@ -2,8 +2,6 @@
 
 Scribe is a high-performance, cross-platform binary forensics library and CLI written in Zig. It parses ELF, Mach-O, and PE binaries with zero-copy techniques, extracts dynamic dependencies and DWARF symbols, computes per-section Shannon entropy, recovers strings via SIMD, fingerprints functions for static-library identification, and weaves Software Bills of Materials (SBOMs) for both individual binaries and full container images — including direct OCI registry pulls without a Docker daemon.
 
-Scribe is the static analysis foundation for [Scribe Live](../scribe-live), the dynamic execution observer.
-
 ---
 
 ## Table of contents
@@ -46,8 +44,11 @@ Scribe is the static analysis foundation for [Scribe Live](../scribe-live), the 
 | 5b    | Security: vuln matcher (OSV-lite + OSV native + binary `.scvd`)    | done  |
 | 5c    | Security: IaC audit (Dockerfile + Kubernetes + OCI image-config)   | done  |
 | 5d    | Security: policy gate, fingerprint cross-ref, `scribe scan` umbrella | done  |
+| 5e    | Security: vulndb merge, NVD CVE 2.0 ingest, CVSS v2 parser           | done  |
+| 3b-ext | Sliding-window fingerprint match (stripped binaries) + x86_64 relocation-normalized hashes | done |
+| 3c-ext | `docker save` cap raised to 8 GiB; env override `SCRIBE_DOCKER_SAVE_CAP_MIB` | partial |
 
-Tests: 125 unit + integration tests (`zig build test`).
+Tests: 132 unit + integration tests (`zig build test`).
 
 ---
 
@@ -568,27 +569,20 @@ Cross-cutting modules: `mmap.zig` (RAII file mapping), `errors.zig` (unified err
 
 ## Roadmap
 
-Shipped: Phases 1 through 5d (forensics core + full security pipeline).
-Open work, by phase:
+Shipped: Phases 1 through 5e plus 3b-ext and 3c-ext (full forensics +
+security pipeline + fingerprint-robustness extensions). Open work:
 
 | Phase   | Item                                                                                  |
 | ------- | ------------------------------------------------------------------------------------- |
-| 3b-ext  | Relocation-normalized fingerprints (PIC GOT/PLT immediates hashed structurally so the same source built against different glibc / base addresses produces the same hash). |
-| 3b-ext  | Sliding-window function detection so stripped binaries (no DWARF / symtab) can match a fingerprint corpus. Today the `fp match` path requires symbol bounds on the target. |
-| 3c-ext  | Stream-mode `docker save` ingestion — current code buffers the full save tar (2 GiB cap) before walking. Streaming would lift the cap and reduce peak RSS on multi-GB images. |
-| 4b      | Mach-O `.dSYM` symbolication (parse the bundle's DWARF, hand off to existing dwarf.zig).|
-| 4c      | PE PDB parsing — scribe already extracts the PDB GUID from the debug directory, but std.zig has no PDB parser, so address → source line lookup is unavailable on PE. |
-| 5e      | `scribe vulndb merge` to combine multiple `.scvd` files in one pass (today: concat JSON + recompile). |
-| 5e      | Full YAML parser for the IaC config audit — current text-pattern scanner doesn't handle anchors, aliases, or Helm-templated manifests. |
-| 5e      | Native NVD CVE JSON 2.0 ingest (today via jq transform — see SECURITY.md). |
-| 5e      | CVSS v2 vector parser (v3.0/v3.1 already supported). |
-| 6       | Function-flow CFG construction, anti-tampering checks, yara-style rule integration.   |
+| 3b-ext+ | Relocation normalization is **approximate** (linear scan for E8/E9 + cond-jump opcodes; can mis-fire on operand bytes embedded in unrelated instructions). Replacing with a real disassembler-driven pass is the next step; the corpus JSON shape stays the same. |
+| 3c-ext+ | True streaming `docker save` ingestion. Today's 8 GiB in-memory cap is configurable via `SCRIBE_DOCKER_SAVE_CAP_MIB` but the full tar is still buffered. Genuine streaming requires `container.collect` to take a `Reader` instead of `[]const u8` — the squash walk has forward references between manifest.json and layer blobs, so the refactor is non-trivial. |
+| 4b      | Mach-O `.dSYM` symbolication (parse the bundle's inner Mach-O DWARF, generalize `dwarf.zig` past ELF section names). |
+| 4c      | PE PDB parsing — scribe extracts the PDB GUID from the debug directory, but std.zig has no PDB parser. Multi-week port from the LLVM/MSF reverse-engineered docs. |
+| 5e+     | Full YAML parser for the IaC config audit — current text-pattern scanner doesn't handle anchors, aliases, or Helm-templated manifests. Covers ~95% of CI-checked manifests as-is. |
+| 6       | Function-flow CFG construction, anti-tampering checks, yara-style rule integration — research direction; deeper static analysis as a foundation for `scribe-live` correlation. |
 
-The Phase-5e items are quality-of-life follow-ons to the security
-pipeline; the core feature set is complete. Phase 6 is the next major
-direction (deeper static analysis, dynamic-pairing primitives for
-`scribe-live`).
-
-`scribe-live`, the dynamic execution observer, lives in the sibling
-[../scribe-live](../scribe-live) repo and depends on this library for
-DWARF symbolication of sampled instruction pointers.
+The `3b-ext+` / `3c-ext+` / `5e+` rows are **partials** — the core
+capability is shipped (sliding-window match, normalized hashes, env-var
+cap, vulndb merge / NVD / CVSS v2 are all working) but the underlying
+architectural item flagged above is the natural follow-on. 4b, 4c, and
+6 are genuinely future work — single-session deliverables they aren't.

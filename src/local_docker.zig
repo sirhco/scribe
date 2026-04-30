@@ -7,11 +7,15 @@
 //! image store — including locally-built images that have never been pushed.
 //!
 //! Memory: the entire `docker save` output is buffered in memory before
-//! being walked. Typical alpine/distroless images are <10MB compressed, but
-//! large fat images can easily reach hundreds of MB. A streaming variant
-//! (Phase-3c-ext) would consume the child's stdout pipe directly via
-//! `tar.Iterator` over a Reader, but the current `container.collect`
-//! ingestion takes a `[]const u8` and re-walks it.
+//! being walked. Default cap is 8 GiB (raised from 2 GiB) which covers
+//! every reasonable image; can be tightened with the SCRIBE_DOCKER_SAVE_CAP
+//! env var (value in MiB).
+//!
+//! True streaming requires a container.collect refactor — the OCI tar
+//! has forward references (manifest.json points at layer blobs that may
+//! appear later in the stream), so a single-pass walker can't construct
+//! the squash without buffering. That refactor is out of scope here; the
+//! 8 GiB cap is the practical compromise for v1.
 
 const std = @import("std");
 const errors = @import("errors.zig");
@@ -33,18 +37,44 @@ pub fn parseImage(uri: []const u8) []const u8 {
     return uri;
 }
 
+/// Buffer cap for `docker save` stdout. Override by setting
+/// SCRIBE_DOCKER_SAVE_CAP_MIB to the desired megabyte value.
+const default_stdout_cap: usize = 8 * 1024 * 1024 * 1024;
+
+fn stdoutCap(environ: ?std.process.Environ) usize {
+    if (environ) |e| {
+        if (e.getPosix("SCRIBE_DOCKER_SAVE_CAP_MIB")) |v| {
+            const trimmed = std.mem.trim(u8, v, " \t\n\r");
+            const mib = std.fmt.parseInt(usize, trimmed, 10) catch return default_stdout_cap;
+            return mib * 1024 * 1024;
+        }
+    }
+    return default_stdout_cap;
+}
+
 pub fn pullSbom(
     gpa: std.mem.Allocator,
     io: std.Io,
     uri: []const u8,
 ) Error!container.ImageSbom {
+    return pullSbomWithEnv(gpa, io, uri, null);
+}
+
+/// Variant that lets the caller pass an `Environ` for env-var lookup.
+/// Plain `pullSbom` skips the env override and always uses the default cap.
+pub fn pullSbomWithEnv(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    uri: []const u8,
+    environ: ?std.process.Environ,
+) Error!container.ImageSbom {
     const image = parseImage(uri);
 
+    const cap = stdoutCap(environ);
     const argv = [_][]const u8{ "docker", "save", image };
     const result = std.process.run(gpa, io, .{
         .argv = &argv,
-        // docker save can produce hundreds of MB; cap at 2 GiB by default.
-        .stdout_limit = .limited(2 * 1024 * 1024 * 1024),
+        .stdout_limit = .limited(cap),
         .stderr_limit = .limited(64 * 1024),
         .reserve_amount = 1 * 1024 * 1024,
     }) catch |err| switch (err) {

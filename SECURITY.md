@@ -275,6 +275,7 @@ exit=1
 
 ```
 scribe vulndb compile <in.json|-> <out.scvd>
+scribe vulndb merge   <out.scvd> <in1> [in2...]
 scribe vulndb update  --from <url> --out <out.scvd>
 ```
 
@@ -291,8 +292,14 @@ supported shape.
 ```bash
 scribe vulndb compile osv-lite.json osv.scvd
 scribe vulndb compile - osv.scvd <  ./osv-feed.json
+scribe vulndb merge   combined.scvd osv-pypi.scvd osv-npm.scvd cisa-kev.scvd
 scribe vulndb update --from https://example.com/advisories.json --out osv.scvd
 ```
+
+`merge` accepts any mix of `.scvd` and JSON inputs — they're loaded
+through `Database.load` (auto-detect: SCVD / scribe-lite / OSV native /
+NVD CVE 2.0). Dedups by `(advisory_id, package)` so cross-feed overlap
+collapses to a single entry. First-occurrence-wins ordering.
 
 > Zig 0.16's `std.http.Client` TLS implementation does not handle every
 > server. If `update` errors with `TlsInitializationFailed`, the binary
@@ -419,12 +426,28 @@ them as separate `.scvd` files and call `scribe vulns` once per DB.
 ### NVD (CVE JSON 2.0)
 
 NVD publishes per-year JSON archives at
-`https://nvd.nist.gov/vuln/data-feeds`. The schema is verbose; the
-shortest path to scribe is to convert NVD CVE Items to OSV-lite via `jq`,
-treating each `cve.id` as the advisory id, `descriptions[].value` as
-summary, and `cpeMatch` entries as ranges. Recipe is fiddly enough to
-warrant a dedicated tool — out of scope here. If you only need critical
-exploited CVEs, use CISA KEV instead.
+`https://nvd.nist.gov/vuln/data-feeds`. scribe ingests NVD CVE 2.0
+**natively** — no jq transform required. `Database.load` auto-routes on
+the wrapped `{"vulnerabilities": [{"cve": ...}]}` shape:
+
+```bash
+curl -sSL <nvd-feed-url> | scribe vulndb compile - nvd.scvd
+```
+
+Per-CVE handling:
+
+- One Advisory per unique CPE product (`cpe:2.3:a:vendor:product:...`).
+- Version bounds: `versionStartIncluding` / `versionStartExcluding` →
+  `introduced`; `versionEndExcluding` / `versionEndIncluding` → `fixed`
+  (Excluding lower / Including upper bounds have minor fence-post error
+  vs. scribe's half-open ranges; same trade-off as OSV `last_affected`).
+- CVSS preference order: v3.1 > v3.0 > v2 (all three formats now parse
+  via `parseCvssVector`).
+- Severity derived from CVSS score using NVD qualitative bands when
+  `database_specific.severity` isn't present.
+
+For "actively exploited" coverage only (much smaller working set), pair
+with CISA KEV via `scribe vulndb merge`.
 
 ### Generic recipe — anything that emits JSON
 
@@ -749,7 +772,7 @@ preserves that invariant.
   scribe's existing convention.
 
 Test suite runs every test under `std.testing.allocator` (leak-detecting
-gpa). 120 tests, no leaks, ASAN-clean.
+gpa). 132 tests, no leaks, ASAN-clean.
 
 ---
 
@@ -883,13 +906,26 @@ Severity color map:
   scribe ranges are half-open. Versions exactly equal to `last_affected`
   won't match. v1 trade-off — affects perhaps 1% of advisories that use
   the inclusive form instead of `fixed`.
-- **CVSS v2 unsupported.** `parseCvssVector` returns null on v2 vectors.
-  Affected advisories will lack a `cvss` field but still match by
-  `severity` (text).
-- **Fingerprint cross-ref needs DWARF on target.** The Wyhash signature
-  scheme keys on DWARF function ranges. Stripped targets without symbols
-  can't be matched today; the fingerprint module (Phase-3b-ext on the
-  scribe roadmap) will gain sliding-window detection for that.
+- **CVSS v2 approximate.** `parseCvssVector` accepts both v2 and v3
+  vectors. v2 base-score formula is implemented per the FIRST v2.0
+  spec; rounding is to one decimal (NVD-standard). The metric tables
+  cover the originally published CVSS v2.0 metrics — v2.0 temporal /
+  environmental scores are ignored.
+- **Fingerprint stripped-binary match is best-effort.** scribe now
+  supports a sliding-window fallback (`fingerprint.matchSliding`) that
+  scans the target's `.text` section in 4-byte strides for any window
+  matching a corpus function size + Wyhash. Auto-engaged by `scribe fp
+  match` when the symbol-driven path returns zero hits. False negatives
+  on functions whose start address isn't 4-byte aligned (rare on x86_64
+  / aarch64). Cost scales as O(text_size × distinct corpus sizes); fine
+  for libraries (~50ms per MB), pricey for monolithic apps with deep
+  corpora — measure for your workload.
+- **Relocation normalization is approximate.** scribe stores both raw
+  Wyhash and a normalized hash that zeros out x86_64 direct-call /
+  direct-jump / conditional-jump 32-bit displacements before hashing.
+  Linear-byte scan can mis-fire on E8/E9/0F bytes appearing as operands
+  of unrelated instructions; replacing with disassembler-driven
+  normalization is `Phase-3b-ext+` on the roadmap.
 - **Wide-string scan is ASCII-aligned only.** Recovers wide strings whose
   even bytes are ASCII printable; doesn't decode actual UTF-16 surrogate
   pairs or BMP characters above 0x7E. Adequate for secret detection.
@@ -911,4 +947,4 @@ Severity color map:
 
 - [README.md](README.md) — base scribe (binary forensics, SBOM, registry/docker pulls).
 - Module-level docs (`//!` headers in each `src/security/*.zig` file).
-- Inline tests (`zig build test`) — 120 tests covering every module.
+- Inline tests (`zig build test`) — 132 tests covering every module.

@@ -18,7 +18,8 @@ const usage =
     \\  scribe scan <path> [opts]      full pipeline: SBOM + secrets + vulns + IaC + fingerprint
     \\                                 ([--db p] [--config p] [--fp-db p] [--include-generic] [--include-wide] [--plain])
     \\  scribe policy <path> --policy <p>  evaluate scan results against policy ([--db d] [--config c] [--json]); exits 1 on fail
-    \\  scribe vulndb compile <in.json> <out.scvd>      compile JSON advisory DB to mmap-friendly binary (.scvd)
+    \\  scribe vulndb compile <in.json|-> <out.scvd>    compile JSON advisory DB to mmap-friendly binary (.scvd)
+    \\  scribe vulndb merge <out.scvd> <in1> [in2...]   merge multiple .scvd or JSON advisory DBs into one
     \\  scribe vulndb update --from <url> --out <p>     fetch advisory JSON over HTTPS, compile to .scvd
     \\  scribe symbols <path>          DWARF function symbols (ELF only)
     \\  scribe addr2line <path> <hex>  resolve address to source location
@@ -229,6 +230,11 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, sub, "compile")) {
             if (args.len < 5) return die(stderr, "error: vulndb compile <in.json> <out.scvd>\n", 1);
             runVulndbCompile(io, gpa, stdout, args[3], args[4]) catch |err| return dieErr(stderr, err);
+            return;
+        }
+        if (std.mem.eql(u8, sub, "merge")) {
+            if (args.len < 5) return die(stderr, "error: vulndb merge <out.scvd> <in1> [in2...]\n", 1);
+            runVulndbMerge(io, gpa, stdout, args[3], args[4..]) catch |err| return dieErr(stderr, err);
             return;
         }
         if (std.mem.eql(u8, sub, "update")) {
@@ -618,13 +624,23 @@ fn runFpMatch(
     var db = try scribe.fingerprint.Database.parseJson(gpa, db_map.bytes());
     defer db.deinit(gpa);
 
-    const hits = try scribe.fingerprint.match(gpa, target_map.bytes(), db);
+    var hits = try scribe.fingerprint.match(gpa, target_map.bytes(), db);
     defer gpa.free(hits);
+
+    var via_sliding = false;
+    if (hits.len == 0) {
+        // Target lacked DWARF/symtab, or no symbol-driven hits. Fall back
+        // to sliding-window match against the corpus's body sizes.
+        gpa.free(hits);
+        hits = scribe.fingerprint.matchSliding(gpa, target_map.bytes(), db) catch &[_]scribe.fingerprint.Match{};
+        via_sliding = true;
+    }
 
     if (hits.len == 0) {
         try out.writeAll("(no fingerprint matches)\n");
         return;
     }
+    if (via_sliding) try out.writeAll("# matches via sliding-window scan (target has no DWARF)\n");
     for (hits) |h| {
         try out.print(
             "0x{x:0>16}  {s:<32}  ->  {s} {s}{s}{s}\n",
@@ -634,7 +650,7 @@ fn runFpMatch(
                 h.db_entry.lib,
                 if (h.db_entry.version) |_| " " else "",
                 h.db_entry.version orelse "",
-                if (!std.mem.eql(u8, h.db_entry.name, h.target_function))
+                if (!via_sliding and !std.mem.eql(u8, h.db_entry.name, h.target_function))
                     " (renamed)"
                 else
                     "",
@@ -1333,6 +1349,48 @@ fn runVulndbCompile(
     try out.print(
         "compiled {d} advisories  ->  {s}  ({d} bytes)\n",
         .{ db.advisories.len, out_path, out_bytes.len },
+    );
+}
+
+fn runVulndbMerge(
+    io: Io,
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    out_path: []const u8,
+    in_paths: []const []const u8,
+) !void {
+    // Mmap each input DB. Lifetimes need to outlive `merge` because borrowed
+    // SCVD strings reference the mappings.
+    var mappings: std.ArrayList(scribe.mmap.Mapping) = .empty;
+    defer {
+        for (mappings.items) |*m| m.deinit();
+        mappings.deinit(gpa);
+    }
+    var dbs: std.ArrayList(scribe.security.vulnerability.Database) = .empty;
+    defer {
+        for (dbs.items) |*d| d.deinit(gpa);
+        dbs.deinit(gpa);
+    }
+
+    for (in_paths) |p| {
+        const m = try scribe.mmap.open(io, p);
+        try mappings.append(gpa, m);
+        const db = try scribe.security.vulnerability.load(gpa, mappings.items[mappings.items.len - 1].bytes());
+        try dbs.append(gpa, db);
+    }
+
+    var merged = try scribe.security.vulnerability.merge(gpa, dbs.items);
+    defer merged.deinit(gpa);
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try scribe.security.vulnerability.writeBinary(merged, &aw.writer);
+    const bytes = aw.written();
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = bytes });
+    try out.print(
+        "merged {d} inputs ({d} advisories total)  ->  {s}  ({d} bytes)\n",
+        .{ in_paths.len, merged.advisories.len, out_path, bytes.len },
     );
 }
 

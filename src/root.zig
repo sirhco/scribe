@@ -45,6 +45,7 @@ pub const SecretFinding = security.secrets.Finding;
 pub const VulnerabilityDb = security.vulnerability.Database;
 pub const Vulnerability = security.vulnerability.Vulnerability;
 pub const matchVulnerabilities = security.vulnerability.match;
+pub const mergeVulnerabilityDbs = security.vulnerability.merge;
 pub const ConfigIssue = security.config.Issue;
 pub const auditConfig = security.config.audit;
 pub const Policy = security.policy.Policy;
