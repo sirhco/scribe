@@ -48,10 +48,28 @@ tar, registry pull, local-docker pull).
 
 ## Quick Start
 
-```bash
-# Build and install
-zig build install
+### Build
 
+```bash
+# Builds the binary into ./zig-out/bin/scribe.
+zig build
+
+# Optional: put it on PATH for the examples below.
+export PATH="$PWD/zig-out/bin:$PATH"
+# Or copy / symlink:
+sudo cp zig-out/bin/scribe /usr/local/bin/
+# Or change the install prefix (see `zig build --help`):
+zig build --prefix /usr/local install
+```
+
+`zig build install` writes to `./zig-out/bin/` by default — same place a
+plain `zig build` puts it. There is no system-wide install target unless
+you pass `--prefix`. If you don't add `zig-out/bin` to `PATH`, invoke the
+binary directly: `./zig-out/bin/scribe ...`.
+
+### Run
+
+```bash
 # Scan a binary for embedded secrets
 scribe secrets ./myapp
 
@@ -80,6 +98,10 @@ scribe vulndb compile osv-lite.json osv.scvd
 # Fetch + compile in one step over HTTPS
 scribe vulndb update --from https://example.com/feed.json --out osv.scvd
 ```
+
+> Examples above assume `scribe` resolves on `PATH`. If you skipped the
+> PATH export above, prefix every invocation with `./zig-out/bin/`
+> (e.g. `./zig-out/bin/scribe secrets ./myapp`).
 
 ---
 
@@ -551,14 +573,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v1
         with: { version: '0.16.0' }
-      - run: zig build install
+      - run: zig build
+      - run: echo "$PWD/zig-out/bin" >> "$GITHUB_PATH"
       - name: Refresh advisory DB
-        run: ./zig-out/bin/scribe vulndb update --from ${{ secrets.OSV_FEED_URL }} --out osv.scvd
+        run: scribe vulndb update --from ${{ secrets.OSV_FEED_URL }} --out osv.scvd
       - name: Build target
         run: cargo build --release
       - name: Policy gate
         run: |
-          ./zig-out/bin/scribe policy ./target/release/myapp \
+          scribe policy ./target/release/myapp \
             --policy .scribe/policy.json \
             --db osv.scvd \
             --config Dockerfile

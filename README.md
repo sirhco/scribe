@@ -60,7 +60,17 @@ git clone https://github.com/<you>/scribe.git
 cd scribe
 zig build                # produces zig-out/bin/scribe
 zig build test           # runs the test suite
+
+# Optional: put it on PATH so the examples below work without ./zig-out/bin/ prefix.
+export PATH="$PWD/zig-out/bin:$PATH"
+# Or override the install prefix:
+zig build --prefix /usr/local install   # writes /usr/local/bin/scribe
 ```
+
+`zig build install` and plain `zig build` both write to
+`./zig-out/bin/scribe` by default — no system-wide install happens unless
+you pass `--prefix`. All examples below assume `scribe` resolves on
+`PATH`; otherwise call the binary directly: `./zig-out/bin/scribe ...`.
 
 Or import as a Zig dependency in another project:
 
