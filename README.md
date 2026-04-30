@@ -512,7 +512,9 @@ Registry source:
 | Entropy            | ✓   | ✓      | ✓   |
 | Fingerprint corpus | ✓   | —      | —   |
 
-Extensions to Mach-O `.dSYM` and PE `.pdb` are tracked under Phase-4b/4c — see [Roadmap](#roadmap).
+Mach-O `.dSYM` symbol enumeration ships in 4b; source-line lookup is
+tracked under 4b+ (blocked on a `std.debug.Dwarf` upstream bug). PE
+`.pdb` parsing is still under 4c. See [Roadmap](#roadmap).
 
 ---
 
@@ -583,9 +585,10 @@ Cross-cutting modules: `mmap.zig` (RAII file mapping), `errors.zig` (unified err
 
 ## Roadmap
 
-Shipped: Phases 1 through 5e plus 3b-ext, 3c-ext, and 5e-ext (full
-forensics + security pipeline + fingerprint-robustness extensions + AST
-YAML for IaC). Open work:
+Shipped: Phases 1 through 5e plus 3b-ext, 3c-ext, 4b, and 5e-ext
+(full forensics + security pipeline + fingerprint-robustness
+extensions + Mach-O `.dSYM` symbol enumeration + AST YAML for IaC +
+mmap-spooled `docker save`). Open work:
 
 | Phase   | Item                                                                                  |
 | ------- | ------------------------------------------------------------------------------------- |
@@ -596,8 +599,11 @@ YAML for IaC). Open work:
 | 5e-ext+ | YAML parser is a deliberate 1.2 subset — no merge keys (`<<:`), no YAML 1.1 booleans (`yes`/`no`/`on`/`off`), no complex keys (`?`). Covers every k8s manifest shape we've audited; widening to full 1.2 is on the table if real users hit it. |
 | 6       | Function-flow CFG construction, anti-tampering checks, yara-style rule integration — research direction; deeper static analysis as a foundation for `scribe-live` correlation. |
 
-The `3b-ext+` / `3c-ext+` / `5e-ext+` rows are **partials** — the core
-capability is shipped (sliding-window match, normalized hashes, env-var
-cap, AST YAML walker covering anchors / flow / Helm) but the underlying
-architectural item flagged above is the natural follow-on. 4b, 4c, and
-6 are genuinely future work — single-session deliverables they aren't.
+The `3b-ext+` / `3c-ext+` / `4b+` / `5e-ext+` rows are **partials** —
+the core capability is shipped (RIP-relative-aware normalized hashes,
+mmap-spooled `docker save`, Mach-O `.dSYM` symbol enumeration, AST YAML
+walker covering anchors / aliases / flow / Helm) but the underlying
+architectural item flagged above is the natural follow-on. `4b+` is
+specifically blocked on a `std.debug.Dwarf` line-program bug, not on
+scribe-side work. `4c` and `6` are genuinely future work — not
+single-session deliverables.

@@ -214,9 +214,12 @@ scribe vulns 'docker://my-org/svc:dev' --db osv.scvd
 scribe config <path> [--type dockerfile|kubernetes] [--json]
 ```
 
-Static analyzer for Infrastructure-as-Code text. Auto-detects via
-basename (`Dockerfile`, `*.yaml`, `*.yml`) and content (first non-comment
-`FROM` for Dockerfile, `apiVersion:` + `kind:` for Kubernetes).
+Static analyzer for Infrastructure-as-Code. Dockerfiles use a
+line-oriented scan (the format is line-significant); Kubernetes
+manifests are parsed as YAML and walked as an AST. Auto-detects via
+basename (`Dockerfile`, `*.yaml`, `*.yml`) and content (first
+non-comment `FROM` for Dockerfile, `apiVersion:` + `kind:` for
+Kubernetes).
 
 ```
 DKR009  [high]  Pipe-to-shell network install  (Dockerfile:3)
@@ -706,10 +709,13 @@ Property name conventions:
 | K8S010  | low      | `image:` uses `:latest` tag (or no tag)                        |
 | K8S011  | high     | `allowPrivilegeEscalation: true`                               |
 
-Multi-document YAML (`---` separators) is supported. Workload kinds
-(`Pod`, `Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`,
+Manifests are parsed as YAML (multi-document `---` streams, anchors /
+aliases, block + flow style, Helm `{{ ... }}` tolerated as opaque
+scalars) and walked as an AST, so `privileged: true` injected via an
+alias is caught the same way as an inline value. Workload kinds (`Pod`,
+`Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`,
 `ReplicaSet`) drive the "missing securityContext / resources" gates;
-`ConfigMap`/`Secret`/`Service`/etc. don't trigger them.
+`ConfigMap` / `Secret` / `Service` / etc. don't trigger them.
 
 ### OCI image-config rules (`OCI`)
 
@@ -922,17 +928,21 @@ Severity color map:
   corpora — measure for your workload.
 - **Relocation normalization is approximate.** scribe stores both raw
   Wyhash and a normalized hash that zeros out x86_64 direct-call /
-  direct-jump / conditional-jump 32-bit displacements before hashing.
-  Linear-byte scan can mis-fire on E8/E9/0F bytes appearing as operands
-  of unrelated instructions; replacing with disassembler-driven
-  normalization is `Phase-3b-ext+` on the roadmap.
+  direct-jump / conditional-jump disp32 plus the disp32 of RIP-relative
+  ModR/M loads / stores / LEAs / indirect-calls (across a curated set
+  of common opcodes). Still a pattern scan — an opcode byte that
+  happens to appear inside another instruction's operand can mis-fire.
+  Replacing with a real x86_64 length decoder is `Phase-3b-ext+` on the
+  roadmap.
 - **Wide-string scan is ASCII-aligned only.** Recovers wide strings whose
   even bytes are ASCII printable; doesn't decode actual UTF-16 surrogate
   pairs or BMP characters above 0x7E. Adequate for secret detection.
-- **YAML scanner is text-pattern based.** No anchor / alias / Helm
-  template expansion. Full YAML parsing is on the roadmap; text scan
-  catches the vast majority of misconfigurations encountered in
-  CI-checked manifests.
+- **YAML audit walks an AST.** The Kubernetes path parses every
+  manifest into a YAML 1.2-subset tree (multi-doc, anchors / aliases,
+  block + flow style, Helm `{{ ... }}` tolerated as opaque scalars) and
+  then walks it for rule matches. Deliberate gaps: no merge keys
+  (`<<:`), no YAML 1.1 booleans (`yes`/`no`/`on`/`off`), no complex
+  keys (`?`). Tracked under `Phase-5e-ext+` on the roadmap.
 - **Network behavior of `vulndb update`.** Uses Zig 0.16's
   `std.http.Client`. TLS cert verification is enabled by default; redirect
   handling is the std default. For self-signed feeds, mirror the JSON
