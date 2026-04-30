@@ -11,6 +11,7 @@ const errors = @import("errors.zig");
 const deps_mod = @import("deps.zig");
 const buildid_mod = @import("buildid.zig");
 const strings_mod = @import("strings.zig");
+const security_secrets = @import("security/secrets.zig");
 
 pub const ComponentKind = enum {
     program,
@@ -39,11 +40,16 @@ pub const Component = struct {
 
 pub const Sbom = struct {
     components: []Component,
+    /// Secret-scan findings. Empty unless populated by the security pipeline.
+    findings: []security_secrets.Finding = &.{},
 
     pub fn deinit(self: *Sbom, allocator: std.mem.Allocator) void {
         for (self.components) |c| freeComponent(allocator, c);
         allocator.free(self.components);
+        for (self.findings) |f| security_secrets.freeFinding(allocator, f);
+        if (self.findings.len != 0) allocator.free(self.findings);
         self.components = &.{};
+        self.findings = &.{};
     }
 };
 
@@ -389,7 +395,24 @@ pub fn writeCycloneDX(writer: *std.Io.Writer, sbom: Sbom) !void {
         try writer.writeAll("\"}]}]}}");
     }
 
-    try writer.writeAll("\n  ]\n}\n");
+    try writer.writeAll("\n  ]");
+    if (sbom.findings.len > 0) {
+        try writer.writeAll(",\n  \"properties\": [");
+        for (sbom.findings, 0..) |f, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeAll("\n    {\"name\": \"scribe:secret:");
+            try writer.writeAll(@tagName(f.kind));
+            try writer.writeAll("\", \"value\": ");
+            try writeJsonString(writer, f.redacted_preview);
+            try writer.print(
+                ", \"confidence\": {d}, \"offset\": {d}",
+                .{ @intFromEnum(f.confidence), f.offset },
+            );
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("\n  ]");
+    }
+    try writer.writeAll("\n}\n");
 }
 
 fn cyclonedxType(k: ComponentKind) []const u8 {

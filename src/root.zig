@@ -21,6 +21,7 @@ pub const dwarf = @import("dwarf.zig");
 pub const fingerprint = @import("fingerprint.zig");
 pub const registry = @import("registry.zig");
 pub const local_docker = @import("local_docker.zig");
+pub const security = @import("security/mod.zig");
 
 pub const ScribeError = errors.ScribeError;
 pub const Arch = elf.Arch;
@@ -38,6 +39,8 @@ pub const parseFormat = format.parse;
 pub const collectDeps = deps.collect;
 pub const shannon = entropy.shannon;
 pub const scanStrings = strings.scan;
+pub const scanSecrets = security.secrets.scan;
+pub const SecretFinding = security.secrets.Finding;
 
 test {
     std.testing.refAllDecls(@This());

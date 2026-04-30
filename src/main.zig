@@ -12,6 +12,7 @@ const usage =
     \\  scribe strings <path> [min]    printable ASCII runs (default min=4)
     \\  scribe entropy <path>          Shannon entropy per section
     \\  scribe sbom <path> [--plain]   bill of materials (CycloneDX 1.5 by default; --plain for human)
+    \\  scribe secrets <path> [opts]   SIMD secret scan ([--json] [--include-generic] [--min-entropy N])
     \\  scribe symbols <path>          DWARF function symbols (ELF only)
     \\  scribe addr2line <path> <hex>  resolve address to source location
     \\  scribe fp generate <path> <lib> [version]    write fingerprint DB to stdout (JSON)
@@ -102,6 +103,29 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, a, "--plain")) plain = true;
         }
         runSbom(io, gpa, stdout, args[2], plain) catch |err| return dieErr(stderr, err);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "secrets")) {
+        if (args.len < 3) return die(stderr, "error: 'secrets' requires a path\n", 1);
+        var json = false;
+        var opts: scribe.security.secrets.ScanOptions = .{};
+        var idx: usize = 3;
+        while (idx < args.len) : (idx += 1) {
+            const a = args[idx];
+            if (std.mem.eql(u8, a, "--json")) {
+                json = true;
+            } else if (std.mem.eql(u8, a, "--include-generic")) {
+                opts.include_generic = true;
+            } else if (std.mem.eql(u8, a, "--min-entropy")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --min-entropy requires a value\n", 1);
+                idx += 1;
+                opts.min_entropy = std.fmt.parseFloat(f32, args[idx]) catch
+                    return die(stderr, "error: invalid --min-entropy value\n", 1);
+            } else {
+                return die(stderr, "error: unknown 'secrets' option\n", 1);
+            }
+        }
+        runSecrets(io, gpa, stdout, args[2], opts, json) catch |err| return dieErr(stderr, err);
         return;
     }
 
@@ -432,6 +456,77 @@ fn runFpMatch(
         );
     }
     try out.print("({d} matches)\n", .{hits.len});
+}
+
+fn runSecrets(
+    io: Io,
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    path: []const u8,
+    opts: scribe.security.secrets.ScanOptions,
+    json: bool,
+) !void {
+    var mapping = try scribe.mmap.open(io, path);
+    defer mapping.deinit();
+
+    var findings = try scribe.security.secrets.scan(gpa, mapping.bytes(), opts);
+    defer findings.deinit(gpa);
+
+    if (json) {
+        try emitFindingsJson(out, findings);
+    } else {
+        try emitFindingsPlain(out, findings);
+    }
+}
+
+fn emitFindingsPlain(out: *Io.Writer, findings: scribe.security.secrets.Findings) !void {
+    if (findings.items.len == 0) {
+        try out.writeAll("(no secrets detected)\n");
+        return;
+    }
+    for (findings.items) |f| {
+        try out.print(
+            "{s:<22}  off=0x{x:0>8}  conf={d:>3}  {s}\n",
+            .{
+                @tagName(f.kind),
+                f.offset,
+                @intFromEnum(f.confidence),
+                f.redacted_preview,
+            },
+        );
+    }
+    try out.print("({d} findings)\n", .{findings.items.len});
+}
+
+fn emitFindingsJson(out: *Io.Writer, findings: scribe.security.secrets.Findings) !void {
+    try out.writeAll("[");
+    for (findings.items, 0..) |f, i| {
+        if (i > 0) try out.writeByte(',');
+        try out.writeAll("\n  {\"kind\": \"");
+        try out.writeAll(@tagName(f.kind));
+        try out.print(
+            "\", \"offset\": {d}, \"length\": {d}, \"entropy\": {d:.3}, \"confidence\": {d}, \"preview\": ",
+            .{ f.offset, f.length, f.entropy, @intFromEnum(f.confidence) },
+        );
+        try writeJsonString(out, f.redacted_preview);
+        try out.writeByte('}');
+    }
+    if (findings.items.len > 0) try out.writeByte('\n');
+    try out.writeAll("]\n");
+}
+
+fn writeJsonString(out: *Io.Writer, s: []const u8) !void {
+    try out.writeByte('"');
+    for (s) |c| switch (c) {
+        '"' => try out.writeAll("\\\""),
+        '\\' => try out.writeAll("\\\\"),
+        '\n' => try out.writeAll("\\n"),
+        '\r' => try out.writeAll("\\r"),
+        '\t' => try out.writeAll("\\t"),
+        0...0x08, 0x0B, 0x0C, 0x0E...0x1F => try out.print("\\u{x:0>4}", .{c}),
+        else => try out.writeByte(c),
+    };
+    try out.writeByte('"');
 }
 
 test "module imports resolve" {
