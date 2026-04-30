@@ -59,7 +59,7 @@ export PATH="$PWD/zig-out/bin:$PATH"
 # Or copy / symlink:
 sudo cp zig-out/bin/scribe /usr/local/bin/
 # Or change the install prefix (see `zig build --help`):
-zig build --prefix /usr/local install
+sudo zig build --prefix /usr/local install
 ```
 
 `zig build install` writes to `./zig-out/bin/` by default — same place a

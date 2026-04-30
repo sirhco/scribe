@@ -64,7 +64,7 @@ zig build test           # runs the test suite
 # Optional: put it on PATH so the examples below work without ./zig-out/bin/ prefix.
 export PATH="$PWD/zig-out/bin:$PATH"
 # Or override the install prefix:
-zig build --prefix /usr/local install   # writes /usr/local/bin/scribe
+sudo zig build --prefix /usr/local install   # writes /usr/local/bin/scribe
 ```
 
 `zig build install` and plain `zig build` both write to
