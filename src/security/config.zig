@@ -1,14 +1,16 @@
-//! IaC misconfiguration analyzer. v1 covers Dockerfiles and Kubernetes
-//! YAML manifests via line-oriented text scans. Proper YAML parsing
-//! (multi-doc, anchors, Helm templating) is the v2 path; for now the rule
-//! engine matches simple `key: value` patterns and handles `---` document
-//! splits.
+//! IaC misconfiguration analyzer. Dockerfiles use a line-oriented text
+//! scan (the format is line-significant). Kubernetes manifests are parsed
+//! as YAML and walked structurally — anchors, aliases, multi-document
+//! streams, and flow vs. block style all resolve to the same AST before
+//! rules fire, so e.g. an alias that injects `privileged: true` is
+//! flagged the same way an inline value would be.
 //!
 //! Rules are stable IDs (DKR### / K8S###) so downstream consumers can
 //! suppress or grade specific findings without depending on text matches.
 
 const std = @import("std");
 const errors = @import("../errors.zig");
+const yaml = @import("../yaml.zig");
 
 pub const Severity = enum { info, low, medium, high, critical };
 
@@ -351,56 +353,35 @@ pub fn auditKubernetes(
         list.deinit(allocator);
     }
 
-    // Split on YAML document separator. Track absolute line numbers.
-    var doc_start_line: u32 = 1;
-    var doc_idx: u32 = 0;
-    var line_iter = std.mem.splitScalar(u8, bytes, '\n');
-    var doc_buf: std.ArrayList(u8) = .empty;
-    defer doc_buf.deinit(allocator);
-    var current_line: u32 = 0;
+    // Parse the manifest into a YAML AST. If parsing fails (truly broken
+    // input), fall back to no findings rather than aborting the whole
+    // security scan — the SBOM/secrets/CVE passes can still produce useful
+    // output for the same target.
+    var stream = yaml.parse(allocator, bytes) catch {
+        const items = list.toOwnedSlice(allocator) catch return error.OutOfMemory;
+        return .{ .items = items };
+    };
+    defer stream.deinit(allocator);
 
-    while (line_iter.next()) |line| {
-        current_line += 1;
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (std.mem.eql(u8, trimmed, "---")) {
-            try auditK8sDoc(allocator, &list, doc_buf.items, path, doc_start_line, doc_idx);
-            doc_buf.clearRetainingCapacity();
-            doc_idx += 1;
-            doc_start_line = current_line + 1;
-            continue;
-        }
-        doc_buf.appendSlice(allocator, line) catch return error.OutOfMemory;
-        doc_buf.append(allocator, '\n') catch return error.OutOfMemory;
-    }
-    if (doc_buf.items.len > 0) {
-        try auditK8sDoc(allocator, &list, doc_buf.items, path, doc_start_line, doc_idx);
+    for (stream.documents) |doc| {
+        try auditK8sDocument(allocator, &list, doc.root, path);
     }
 
     const items = list.toOwnedSlice(allocator) catch return error.OutOfMemory;
     return .{ .items = items };
 }
 
-fn auditK8sDoc(
+fn auditK8sDocument(
     allocator: std.mem.Allocator,
     list: *std.ArrayList(Issue),
-    doc: []const u8,
+    root: yaml.Node,
     path: []const u8,
-    base_line: u32,
-    doc_idx: u32,
 ) errors.ScribeError!void {
-    if (doc.len == 0) return;
-    _ = doc_idx;
+    if (root.kind != .mapping) return;
 
-    const kind = readYamlValue(doc, "kind") orelse "";
-    const is_workload = std.mem.eql(u8, kind, "Pod") or
-        std.mem.eql(u8, kind, "Deployment") or
-        std.mem.eql(u8, kind, "StatefulSet") or
-        std.mem.eql(u8, kind, "DaemonSet") or
-        std.mem.eql(u8, kind, "Job") or
-        std.mem.eql(u8, kind, "CronJob") or
-        std.mem.eql(u8, kind, "ReplicaSet");
+    const kind_str = root.getScalar("kind") orelse "";
+    const is_workload = isWorkloadKind(kind_str);
 
-    // Per-rule: walk lines, look for `key: value` pattern.
     const KvRule = struct {
         rule_id: []const u8,
         title: []const u8,
@@ -433,131 +414,191 @@ fn auditK8sDoc(
            .recommendation = "Set allowPrivilegeEscalation: false." },
     };
 
-    inline for (kv_rules) |r| {
-        if (findKv(doc, r.key, r.value)) |hit| {
+    for (kv_rules) |r| {
+        try findKvAndAdd(allocator, list, root, path, r.key, r.value, r.rule_id, r.title, r.severity, r.recommendation);
+    }
+
+    try findCapabilitiesSysAdmin(allocator, list, root, path);
+    try findImageLatestAst(allocator, list, root, path);
+
+    if (is_workload) {
+        if (!hasDescendantMappingKey(root, "securityContext")) {
             try addIssue(allocator, list, .{
-                .rule_id = r.rule_id,
-                .title = r.title,
-                .severity = r.severity,
+                .rule_id = "K8S002",
+                .title = "Workload missing securityContext block",
+                .severity = .medium,
                 .source = .kubernetes,
                 .path = path,
-                .line = base_line + hit.line - 1,
-                .snippet = hit.raw,
-                .recommendation = r.recommendation,
+                .line = 0,
+                .snippet = "",
+                .recommendation = "Add securityContext with runAsNonRoot, readOnlyRootFilesystem, and capabilities.drop: ['ALL'].",
+            });
+        }
+        if (!hasDescendantMappingKey(root, "resources")) {
+            try addIssue(allocator, list, .{
+                .rule_id = "K8S008",
+                .title = "Workload missing resources.limits / requests",
+                .severity = .low,
+                .source = .kubernetes,
+                .path = path,
+                .line = 0,
+                .snippet = "",
+                .recommendation = "Set resources.requests and resources.limits to bound CPU/memory.",
             });
         }
     }
-
-    if (findSubstring(doc, "SYS_ADMIN")) |hit| {
-        try addIssue(allocator, list, .{
-            .rule_id = "K8S007",
-            .title = "capabilities.add includes SYS_ADMIN",
-            .severity = .critical,
-            .source = .kubernetes,
-            .path = path,
-            .line = base_line + hit.line - 1,
-            .snippet = hit.raw,
-            .recommendation = "Drop SYS_ADMIN; it is effectively root.",
-        });
-    }
-
-    if (is_workload and std.mem.indexOf(u8, doc, "securityContext") == null) {
-        try addIssue(allocator, list, .{
-            .rule_id = "K8S002",
-            .title = "Workload missing securityContext block",
-            .severity = .medium,
-            .source = .kubernetes,
-            .path = path,
-            .line = 0,
-            .snippet = "",
-            .recommendation = "Add securityContext with runAsNonRoot, readOnlyRootFilesystem, and capabilities.drop: ['ALL'].",
-        });
-    }
-
-    if (is_workload and std.mem.indexOf(u8, doc, "resources:") == null) {
-        try addIssue(allocator, list, .{
-            .rule_id = "K8S008",
-            .title = "Workload missing resources.limits / requests",
-            .severity = .low,
-            .source = .kubernetes,
-            .path = path,
-            .line = 0,
-            .snippet = "",
-            .recommendation = "Set resources.requests and resources.limits to bound CPU/memory.",
-        });
-    }
-
-    if (findImageLatest(doc)) |hit| {
-        try addIssue(allocator, list, .{
-            .rule_id = "K8S010",
-            .title = "image uses :latest tag",
-            .severity = .low,
-            .source = .kubernetes,
-            .path = path,
-            .line = base_line + hit.line - 1,
-            .snippet = hit.raw,
-            .recommendation = "Pin to a specific tag or @sha256: digest.",
-        });
-    }
 }
 
-fn readYamlValue(doc: []const u8, key: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, doc, '\n');
-    while (it.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (std.mem.startsWith(u8, trimmed, key)) {
-            const after = trimmed[key.len..];
-            if (after.len > 0 and after[0] == ':') {
-                return std.mem.trim(u8, after[1..], " \t\"'");
+fn isWorkloadKind(kind: []const u8) bool {
+    const kinds = [_][]const u8{
+        "Pod", "Deployment", "StatefulSet", "DaemonSet",
+        "Job", "CronJob", "ReplicaSet",
+    };
+    for (kinds) |k| {
+        if (std.mem.eql(u8, kind, k)) return true;
+    }
+    return false;
+}
+
+/// Recursively walk the tree and emit an issue at every mapping where
+/// `key: value` matches. Multiple matches in different containers each
+/// produce a finding (line numbers carry from yaml.zig).
+fn findKvAndAdd(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(Issue),
+    node: yaml.Node,
+    path: []const u8,
+    key: []const u8,
+    expected: []const u8,
+    rule_id: []const u8,
+    title: []const u8,
+    severity: Severity,
+    recommendation: []const u8,
+) errors.ScribeError!void {
+    switch (node.kind) {
+        .mapping => {
+            for (node.map) |kv| {
+                if (std.mem.eql(u8, kv.key, key) and kv.value.kind == .scalar and
+                    std.mem.eql(u8, kv.value.scalar, expected))
+                {
+                    try addIssue(allocator, list, .{
+                        .rule_id = rule_id,
+                        .title = title,
+                        .severity = severity,
+                        .source = .kubernetes,
+                        .path = path,
+                        .line = kv.line,
+                        .snippet = "",
+                        .recommendation = recommendation,
+                    });
+                }
+                try findKvAndAdd(allocator, list, kv.value, path, key, expected, rule_id, title, severity, recommendation);
             }
-        }
+        },
+        .sequence => {
+            for (node.seq) |child| {
+                try findKvAndAdd(allocator, list, child, path, key, expected, rule_id, title, severity, recommendation);
+            }
+        },
+        .scalar => {},
     }
-    return null;
 }
 
-fn findKv(doc: []const u8, key: []const u8, value: []const u8) ?struct { line: u32, raw: []const u8 } {
-    var it = std.mem.splitScalar(u8, doc, '\n');
-    var n: u32 = 0;
-    while (it.next()) |line| {
-        n += 1;
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (!std.mem.startsWith(u8, trimmed, key)) continue;
-        const after = trimmed[key.len..];
-        if (after.len == 0 or after[0] != ':') continue;
-        const v = std.mem.trim(u8, after[1..], " \t\"'");
-        if (std.mem.eql(u8, v, value)) return .{ .line = n, .raw = line };
+fn findCapabilitiesSysAdmin(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(Issue),
+    node: yaml.Node,
+    path: []const u8,
+) errors.ScribeError!void {
+    switch (node.kind) {
+        .mapping => {
+            for (node.map) |kv| {
+                if (std.mem.eql(u8, kv.key, "capabilities") and kv.value.kind == .mapping) {
+                    if (kv.value.get("add")) |add_node| {
+                        if (add_node.kind == .sequence) {
+                            for (add_node.seq) |item| {
+                                if (item.kind == .scalar and std.mem.eql(u8, item.scalar, "SYS_ADMIN")) {
+                                    try addIssue(allocator, list, .{
+                                        .rule_id = "K8S007",
+                                        .title = "capabilities.add includes SYS_ADMIN",
+                                        .severity = .critical,
+                                        .source = .kubernetes,
+                                        .path = path,
+                                        .line = if (item.line != 0) item.line else add_node.line,
+                                        .snippet = "SYS_ADMIN",
+                                        .recommendation = "Drop SYS_ADMIN; it is effectively root.",
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                try findCapabilitiesSysAdmin(allocator, list, kv.value, path);
+            }
+        },
+        .sequence => for (node.seq) |child| try findCapabilitiesSysAdmin(allocator, list, child, path),
+        .scalar => {},
     }
-    return null;
 }
 
-fn findSubstring(doc: []const u8, needle: []const u8) ?struct { line: u32, raw: []const u8 } {
-    var it = std.mem.splitScalar(u8, doc, '\n');
-    var n: u32 = 0;
-    while (it.next()) |line| {
-        n += 1;
-        if (std.mem.indexOf(u8, line, needle) != null) return .{ .line = n, .raw = line };
+fn findImageLatestAst(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(Issue),
+    node: yaml.Node,
+    path: []const u8,
+) errors.ScribeError!void {
+    switch (node.kind) {
+        .mapping => {
+            for (node.map) |kv| {
+                if (std.mem.eql(u8, kv.key, "image") and kv.value.kind == .scalar) {
+                    const img = kv.value.scalar;
+                    if (img.len > 0 and imageDefaultsToLatest(img)) {
+                        try addIssue(allocator, list, .{
+                            .rule_id = "K8S010",
+                            .title = "image uses :latest tag",
+                            .severity = .low,
+                            .source = .kubernetes,
+                            .path = path,
+                            .line = kv.line,
+                            .snippet = img,
+                            .recommendation = "Pin to a specific tag or @sha256: digest.",
+                        });
+                    }
+                }
+                try findImageLatestAst(allocator, list, kv.value, path);
+            }
+        },
+        .sequence => for (node.seq) |child| try findImageLatestAst(allocator, list, child, path),
+        .scalar => {},
     }
-    return null;
 }
 
-fn findImageLatest(doc: []const u8) ?struct { line: u32, raw: []const u8 } {
-    var it = std.mem.splitScalar(u8, doc, '\n');
-    var n: u32 = 0;
-    while (it.next()) |line| {
-        n += 1;
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (!std.mem.startsWith(u8, trimmed, "image:")) continue;
-        const after = std.mem.trim(u8, trimmed["image:".len..], " \t\"'");
-        if (std.mem.endsWith(u8, after, ":latest")) return .{ .line = n, .raw = line };
-        // No tag at all (and not @digest) → defaults to :latest.
-        if (std.mem.indexOfScalar(u8, after, '@') == null and
-            std.mem.lastIndexOfScalar(u8, after, ':') == null and
-            after.len > 0)
-        {
-            return .{ .line = n, .raw = line };
-        }
+fn imageDefaultsToLatest(img: []const u8) bool {
+    if (std.mem.endsWith(u8, img, ":latest")) return true;
+    // A digest pin (`name@sha256:...`) is explicit — never warn.
+    if (std.mem.indexOfScalar(u8, img, '@') != null) return false;
+    // No `:tag` at all → docker resolves as :latest.
+    if (std.mem.lastIndexOfScalar(u8, img, ':') == null) return true;
+    return false;
+}
+
+fn hasDescendantMappingKey(node: yaml.Node, key: []const u8) bool {
+    switch (node.kind) {
+        .mapping => {
+            for (node.map) |kv| {
+                if (std.mem.eql(u8, kv.key, key)) return true;
+                if (hasDescendantMappingKey(kv.value, key)) return true;
+            }
+            return false;
+        },
+        .sequence => {
+            for (node.seq) |child| {
+                if (hasDescendantMappingKey(child, key)) return true;
+            }
+            return false;
+        },
+        .scalar => return false,
     }
-    return null;
 }
 
 // ----------------------------------------------------------------------------
@@ -849,7 +890,7 @@ test "Dockerfile: clean Dockerfile reports only HEALTHCHECK info if missing" {
 }
 
 test "Kubernetes: privileged + hostNetwork flagged" {
-    const yaml =
+    const manifest =
         \\apiVersion: v1
         \\kind: Pod
         \\metadata:
@@ -864,14 +905,14 @@ test "Kubernetes: privileged + hostNetwork flagged" {
         \\    resources:
         \\      requests: {cpu: "10m"}
     ;
-    var r = try auditKubernetes(testing.allocator, yaml, "pod.yaml");
+    var r = try auditKubernetes(testing.allocator, manifest, "pod.yaml");
     defer r.deinit(testing.allocator);
     try testing.expect(hasRule(r.items, "K8S004"));
     try testing.expect(hasRule(r.items, "K8S006"));
 }
 
 test "Kubernetes: missing securityContext on Deployment" {
-    const yaml =
+    const manifest =
         \\apiVersion: apps/v1
         \\kind: Deployment
         \\metadata:
@@ -884,13 +925,13 @@ test "Kubernetes: missing securityContext on Deployment" {
         \\        image: app:1.0
         \\        resources: {}
     ;
-    var r = try auditKubernetes(testing.allocator, yaml, "deploy.yaml");
+    var r = try auditKubernetes(testing.allocator, manifest, "deploy.yaml");
     defer r.deinit(testing.allocator);
     try testing.expect(hasRule(r.items, "K8S002"));
 }
 
 test "Kubernetes: image latest tag flagged" {
-    const yaml =
+    const manifest =
         \\apiVersion: v1
         \\kind: Pod
         \\metadata: {name: p}
@@ -901,13 +942,13 @@ test "Kubernetes: image latest tag flagged" {
         \\    securityContext: {runAsNonRoot: true}
         \\    resources: {limits: {cpu: "1"}}
     ;
-    var r = try auditKubernetes(testing.allocator, yaml, "p.yaml");
+    var r = try auditKubernetes(testing.allocator, manifest, "p.yaml");
     defer r.deinit(testing.allocator);
     try testing.expect(hasRule(r.items, "K8S010"));
 }
 
 test "Kubernetes: SYS_ADMIN capability flagged" {
-    const yaml =
+    const manifest =
         \\apiVersion: v1
         \\kind: Pod
         \\metadata: {name: p}
@@ -920,13 +961,13 @@ test "Kubernetes: SYS_ADMIN capability flagged" {
         \\        add: ["SYS_ADMIN"]
         \\    resources: {limits: {cpu: "1"}}
     ;
-    var r = try auditKubernetes(testing.allocator, yaml, "p.yaml");
+    var r = try auditKubernetes(testing.allocator, manifest, "p.yaml");
     defer r.deinit(testing.allocator);
     try testing.expect(hasRule(r.items, "K8S007"));
 }
 
 test "Kubernetes: multi-doc separates rules per document" {
-    const yaml =
+    const manifest =
         \\apiVersion: v1
         \\kind: Pod
         \\metadata: {name: a}
@@ -940,7 +981,7 @@ test "Kubernetes: multi-doc separates rules per document" {
         \\metadata: {name: cm}
         \\data: {k: v}
     ;
-    var r = try auditKubernetes(testing.allocator, yaml, "multi.yaml");
+    var r = try auditKubernetes(testing.allocator, manifest, "multi.yaml");
     defer r.deinit(testing.allocator);
     // hostNetwork from first doc only; ConfigMap is not a workload.
     try testing.expectEqual(@as(usize, 1), countByRule(r.items, "K8S004"));
@@ -955,8 +996,8 @@ test "detectAndAudit picks Dockerfile by basename" {
 }
 
 test "detectAndAudit picks Kubernetes by extension" {
-    const yaml = "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: x}\n";
-    var r = try detectAndAudit(testing.allocator, yaml, "cm.yaml");
+    const manifest = "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: x}\n";
+    var r = try detectAndAudit(testing.allocator, manifest, "cm.yaml");
     defer r.deinit(testing.allocator);
     // ConfigMap is not a workload; should be clean.
     try testing.expectEqual(@as(usize, 0), r.items.len);

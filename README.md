@@ -45,10 +45,11 @@ Scribe is a high-performance, cross-platform binary forensics library and CLI wr
 | 5c    | Security: IaC audit (Dockerfile + Kubernetes + OCI image-config)   | done  |
 | 5d    | Security: policy gate, fingerprint cross-ref, `scribe scan` umbrella | done  |
 | 5e    | Security: vulndb merge, NVD CVE 2.0 ingest, CVSS v2 parser           | done  |
+| 5e-ext | IaC audit driven by an AST YAML walker (multi-doc, anchors/aliases, block + flow style, Helm `{{ ... }}` tolerated) | done |
 | 3b-ext | Sliding-window fingerprint match (stripped binaries) + x86_64 relocation-normalized hashes | done |
 | 3c-ext | `docker save` cap raised to 8 GiB; env override `SCRIBE_DOCKER_SAVE_CAP_MIB` | partial |
 
-Tests: 132 unit + integration tests (`zig build test`).
+Tests: 141 unit + integration tests (`zig build test`).
 
 ---
 
@@ -426,6 +427,7 @@ Module surface:
 | `scribe.security.vulnerability` | Advisory matcher (OSV-lite, OSV native, SCVD binary) |
 | `scribe.security.config`      | IaC audit (Dockerfile, Kubernetes, OCI image-config) |
 | `scribe.security.policy`      | JSON-driven gatekeeper over a populated `Sbom`       |
+| `scribe.yaml`                 | YAML 1.2 subset parser (multi-doc, anchors/aliases, block + flow, Helm tolerated) — backs the Kubernetes audit |
 
 All public APIs allocate via the caller's allocator; no implicit globals.
 `*Info` and `Sbom` types own their string buffers and require explicit
@@ -569,8 +571,9 @@ Cross-cutting modules: `mmap.zig` (RAII file mapping), `errors.zig` (unified err
 
 ## Roadmap
 
-Shipped: Phases 1 through 5e plus 3b-ext and 3c-ext (full forensics +
-security pipeline + fingerprint-robustness extensions). Open work:
+Shipped: Phases 1 through 5e plus 3b-ext, 3c-ext, and 5e-ext (full
+forensics + security pipeline + fingerprint-robustness extensions + AST
+YAML for IaC). Open work:
 
 | Phase   | Item                                                                                  |
 | ------- | ------------------------------------------------------------------------------------- |
@@ -578,11 +581,11 @@ security pipeline + fingerprint-robustness extensions). Open work:
 | 3c-ext+ | True streaming `docker save` ingestion. Today's 8 GiB in-memory cap is configurable via `SCRIBE_DOCKER_SAVE_CAP_MIB` but the full tar is still buffered. Genuine streaming requires `container.collect` to take a `Reader` instead of `[]const u8` — the squash walk has forward references between manifest.json and layer blobs, so the refactor is non-trivial. |
 | 4b      | Mach-O `.dSYM` symbolication (parse the bundle's inner Mach-O DWARF, generalize `dwarf.zig` past ELF section names). |
 | 4c      | PE PDB parsing — scribe extracts the PDB GUID from the debug directory, but std.zig has no PDB parser. Multi-week port from the LLVM/MSF reverse-engineered docs. |
-| 5e+     | Full YAML parser for the IaC config audit — current text-pattern scanner doesn't handle anchors, aliases, or Helm-templated manifests. Covers ~95% of CI-checked manifests as-is. |
+| 5e-ext+ | YAML parser is a deliberate 1.2 subset — no merge keys (`<<:`), no YAML 1.1 booleans (`yes`/`no`/`on`/`off`), no complex keys (`?`). Covers every k8s manifest shape we've audited; widening to full 1.2 is on the table if real users hit it. |
 | 6       | Function-flow CFG construction, anti-tampering checks, yara-style rule integration — research direction; deeper static analysis as a foundation for `scribe-live` correlation. |
 
-The `3b-ext+` / `3c-ext+` / `5e+` rows are **partials** — the core
+The `3b-ext+` / `3c-ext+` / `5e-ext+` rows are **partials** — the core
 capability is shipped (sliding-window match, normalized hashes, env-var
-cap, vulndb merge / NVD / CVSS v2 are all working) but the underlying
+cap, AST YAML walker covering anchors / flow / Helm) but the underlying
 architectural item flagged above is the natural follow-on. 4b, 4c, and
 6 are genuinely future work — single-session deliverables they aren't.
