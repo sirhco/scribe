@@ -12,6 +12,7 @@ const deps_mod = @import("deps.zig");
 const buildid_mod = @import("buildid.zig");
 const strings_mod = @import("strings.zig");
 const security_secrets = @import("security/secrets.zig");
+const security_vuln = @import("security/vulnerability.zig");
 
 pub const ComponentKind = enum {
     program,
@@ -42,14 +43,19 @@ pub const Sbom = struct {
     components: []Component,
     /// Secret-scan findings. Empty unless populated by the security pipeline.
     findings: []security_secrets.Finding = &.{},
+    /// CVE / advisory matches. Empty unless populated by the security pipeline.
+    vulnerabilities: []security_vuln.Vulnerability = &.{},
 
     pub fn deinit(self: *Sbom, allocator: std.mem.Allocator) void {
         for (self.components) |c| freeComponent(allocator, c);
         allocator.free(self.components);
         for (self.findings) |f| security_secrets.freeFinding(allocator, f);
         if (self.findings.len != 0) allocator.free(self.findings);
+        for (self.vulnerabilities) |v| security_vuln.freeVulnerability(allocator, v);
+        if (self.vulnerabilities.len != 0) allocator.free(self.vulnerabilities);
         self.components = &.{};
         self.findings = &.{};
+        self.vulnerabilities = &.{};
     }
 };
 
@@ -412,7 +418,46 @@ pub fn writeCycloneDX(writer: *std.Io.Writer, sbom: Sbom) !void {
         }
         try writer.writeAll("\n  ]");
     }
+    if (sbom.vulnerabilities.len > 0) {
+        try writer.writeAll(",\n  \"vulnerabilities\": [");
+        for (sbom.vulnerabilities, 0..) |v, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeAll("\n    {\"id\": ");
+            try writeJsonString(writer, v.advisory_id);
+            try writer.writeAll(", \"description\": ");
+            try writeJsonString(writer, v.summary);
+            try writer.writeAll(", \"ratings\": [{\"severity\": \"");
+            try writer.writeAll(@tagName(v.severity));
+            try writer.writeByte('"');
+            if (v.cvss) |c| try writer.print(", \"score\": {d:.2}, \"method\": \"CVSSv3\"", .{c});
+            try writer.writeAll("}], \"affects\": [{\"ref\": ");
+            try writeAffectsRef(writer, v);
+            try writer.writeAll("}]");
+            if (v.references.len > 0) {
+                try writer.writeAll(", \"advisories\": [");
+                for (v.references, 0..) |ref, j| {
+                    if (j > 0) try writer.writeByte(',');
+                    try writer.writeAll("{\"url\": ");
+                    try writeJsonString(writer, ref);
+                    try writer.writeByte('}');
+                }
+                try writer.writeByte(']');
+            }
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("\n  ]");
+    }
     try writer.writeAll("\n}\n");
+}
+
+fn writeAffectsRef(writer: *std.Io.Writer, v: security_vuln.Vulnerability) !void {
+    try writer.writeByte('"');
+    for (v.package) |c| try writer.writeByte(c);
+    if (v.matched_version) |ver| {
+        try writer.writeByte('@');
+        for (ver) |c| try writer.writeByte(c);
+    }
+    try writer.writeByte('"');
 }
 
 fn cyclonedxType(k: ComponentKind) []const u8 {

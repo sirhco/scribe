@@ -41,6 +41,9 @@ pub const shannon = entropy.shannon;
 pub const scanStrings = strings.scan;
 pub const scanSecrets = security.secrets.scan;
 pub const SecretFinding = security.secrets.Finding;
+pub const VulnerabilityDb = security.vulnerability.Database;
+pub const Vulnerability = security.vulnerability.Vulnerability;
+pub const matchVulnerabilities = security.vulnerability.match;
 
 test {
     std.testing.refAllDecls(@This());

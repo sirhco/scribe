@@ -13,6 +13,8 @@ const usage =
     \\  scribe entropy <path>          Shannon entropy per section
     \\  scribe sbom <path> [--plain]   bill of materials (CycloneDX 1.5 by default; --plain for human)
     \\  scribe secrets <path> [opts]   SIMD secret scan ([--json] [--include-generic] [--min-entropy N])
+    \\  scribe vulns <path> --db <p>   match SBOM components against advisory DB ([--json])
+    \\  scribe scan <path> [opts]      full pipeline: SBOM + secrets + vulns ([--db p] [--include-generic] [--plain])
     \\  scribe symbols <path>          DWARF function symbols (ELF only)
     \\  scribe addr2line <path> <hex>  resolve address to source location
     \\  scribe fp generate <path> <lib> [version]    write fingerprint DB to stdout (JSON)
@@ -126,6 +128,55 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         runSecrets(io, gpa, stdout, args[2], opts, json) catch |err| return dieErr(stderr, err);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "vulns")) {
+        if (args.len < 3) return die(stderr, "error: 'vulns' requires a path\n", 1);
+        var json = false;
+        var db_path: ?[]const u8 = null;
+        var idx: usize = 3;
+        while (idx < args.len) : (idx += 1) {
+            const a = args[idx];
+            if (std.mem.eql(u8, a, "--json")) {
+                json = true;
+            } else if (std.mem.eql(u8, a, "--db")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --db requires a path\n", 1);
+                idx += 1;
+                db_path = args[idx];
+            } else {
+                return die(stderr, "error: unknown 'vulns' option\n", 1);
+            }
+        }
+        const db = db_path orelse return die(stderr, "error: 'vulns' requires --db <path>\n", 1);
+        runVulns(io, gpa, stdout, args[2], db, json) catch |err| return dieErr(stderr, err);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "scan")) {
+        if (args.len < 3) return die(stderr, "error: 'scan' requires a path\n", 1);
+        var plain = false;
+        var db_path: ?[]const u8 = null;
+        var sec_opts: scribe.security.secrets.ScanOptions = .{};
+        var idx: usize = 3;
+        while (idx < args.len) : (idx += 1) {
+            const a = args[idx];
+            if (std.mem.eql(u8, a, "--plain")) {
+                plain = true;
+            } else if (std.mem.eql(u8, a, "--include-generic")) {
+                sec_opts.include_generic = true;
+            } else if (std.mem.eql(u8, a, "--min-entropy")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --min-entropy requires a value\n", 1);
+                idx += 1;
+                sec_opts.min_entropy = std.fmt.parseFloat(f32, args[idx]) catch
+                    return die(stderr, "error: invalid --min-entropy value\n", 1);
+            } else if (std.mem.eql(u8, a, "--db")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --db requires a path\n", 1);
+                idx += 1;
+                db_path = args[idx];
+            } else {
+                return die(stderr, "error: unknown 'scan' option\n", 1);
+            }
+        }
+        runScan(io, gpa, stdout, args[2], db_path, sec_opts, plain) catch |err| return dieErr(stderr, err);
         return;
     }
 
@@ -513,6 +564,167 @@ fn emitFindingsJson(out: *Io.Writer, findings: scribe.security.secrets.Findings)
     }
     if (findings.items.len > 0) try out.writeByte('\n');
     try out.writeAll("]\n");
+}
+
+fn runVulns(
+    io: Io,
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    target_path: []const u8,
+    db_path: []const u8,
+    json: bool,
+) !void {
+    var target = try scribe.mmap.open(io, target_path);
+    defer target.deinit();
+    var db_map = try scribe.mmap.open(io, db_path);
+    defer db_map.deinit();
+
+    var db = try scribe.security.vulnerability.Database.parseJson(gpa, db_map.bytes());
+    defer db.deinit(gpa);
+
+    var bom = try scribe.sbom.collect(gpa, target.bytes());
+    defer bom.deinit(gpa);
+
+    const refs = try gpa.alloc(scribe.security.vulnerability.ComponentRef, bom.components.len);
+    defer gpa.free(refs);
+    for (bom.components, 0..) |c, i| {
+        refs[i] = .{ .name = c.name, .version = if (c.version) |v| v else null };
+    }
+
+    var vulns = try scribe.security.vulnerability.match(gpa, refs, db);
+    defer vulns.deinit(gpa);
+
+    if (json) {
+        try emitVulnsJson(out, vulns);
+    } else {
+        try emitVulnsPlain(out, vulns);
+    }
+}
+
+fn emitVulnsPlain(out: *Io.Writer, vulns: scribe.security.vulnerability.Vulnerabilities) !void {
+    if (vulns.items.len == 0) {
+        try out.writeAll("(no advisories matched)\n");
+        return;
+    }
+    for (vulns.items) |v| {
+        try out.print(
+            "{s:<18}  {s}{s}{s}  [{s}]",
+            .{
+                v.advisory_id,
+                v.package,
+                if (v.matched_version != null) "@" else "",
+                v.matched_version orelse "",
+                @tagName(v.severity),
+            },
+        );
+        if (v.cvss) |c| try out.print(" cvss={d:.1}", .{c});
+        if (v.fixed_version) |f| try out.print(" fixed={s}", .{f});
+        try out.print("\n  {s}\n", .{v.summary});
+    }
+    try out.print("({d} vulnerabilities)\n", .{vulns.items.len});
+}
+
+fn emitVulnsJson(out: *Io.Writer, vulns: scribe.security.vulnerability.Vulnerabilities) !void {
+    try out.writeAll("[");
+    for (vulns.items, 0..) |v, i| {
+        if (i > 0) try out.writeByte(',');
+        try out.writeAll("\n  {\"id\": ");
+        try writeJsonString(out, v.advisory_id);
+        try out.writeAll(", \"package\": ");
+        try writeJsonString(out, v.package);
+        if (v.matched_version) |ver| {
+            try out.writeAll(", \"version\": ");
+            try writeJsonString(out, ver);
+        }
+        try out.writeAll(", \"severity\": \"");
+        try out.writeAll(@tagName(v.severity));
+        try out.writeByte('"');
+        if (v.cvss) |c| try out.print(", \"cvss\": {d:.2}", .{c});
+        if (v.fixed_version) |f| {
+            try out.writeAll(", \"fixed\": ");
+            try writeJsonString(out, f);
+        }
+        try out.writeAll(", \"summary\": ");
+        try writeJsonString(out, v.summary);
+        if (v.references.len > 0) {
+            try out.writeAll(", \"references\": [");
+            for (v.references, 0..) |r, j| {
+                if (j > 0) try out.writeByte(',');
+                try writeJsonString(out, r);
+            }
+            try out.writeByte(']');
+        }
+        try out.writeByte('}');
+    }
+    if (vulns.items.len > 0) try out.writeByte('\n');
+    try out.writeAll("]\n");
+}
+
+fn runScan(
+    io: Io,
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    target_path: []const u8,
+    db_path: ?[]const u8,
+    sec_opts: scribe.security.secrets.ScanOptions,
+    plain: bool,
+) !void {
+    var target = try scribe.mmap.open(io, target_path);
+    defer target.deinit();
+    const bytes = target.bytes();
+
+    var bom = try scribe.sbom.collect(gpa, bytes);
+    defer bom.deinit(gpa);
+
+    var findings = try scribe.security.secrets.scan(gpa, bytes, sec_opts);
+    bom.findings = findings.items; // ownership moves into Sbom.deinit
+    findings.items = &.{};
+
+    if (db_path) |dp| {
+        var db_map = try scribe.mmap.open(io, dp);
+        defer db_map.deinit();
+        var db = try scribe.security.vulnerability.Database.parseJson(gpa, db_map.bytes());
+        defer db.deinit(gpa);
+
+        const refs = try gpa.alloc(scribe.security.vulnerability.ComponentRef, bom.components.len);
+        defer gpa.free(refs);
+        for (bom.components, 0..) |c, i| {
+            refs[i] = .{ .name = c.name, .version = if (c.version) |v| v else null };
+        }
+        var vulns = try scribe.security.vulnerability.match(gpa, refs, db);
+        bom.vulnerabilities = vulns.items;
+        vulns.items = &.{};
+    }
+
+    if (plain) {
+        try emitSbom(out, bom, true);
+        if (bom.findings.len > 0) {
+            try out.writeAll("\nsecrets:\n");
+            for (bom.findings) |f| {
+                try out.print(
+                    "  {s:<22}  off=0x{x:0>8}  conf={d:>3}  {s}\n",
+                    .{ @tagName(f.kind), f.offset, @intFromEnum(f.confidence), f.redacted_preview },
+                );
+            }
+        }
+        if (bom.vulnerabilities.len > 0) {
+            try out.writeAll("\nvulnerabilities:\n");
+            for (bom.vulnerabilities) |v| {
+                try out.print(
+                    "  {s:<18}  {s}{s}{s}  [{s}]\n",
+                    .{
+                        v.advisory_id,
+                        v.package,
+                        if (v.matched_version != null) "@" else "",
+                        v.matched_version orelse "",
+                        @tagName(v.severity),
+                    },
+                );
+            }
+        }
+    } else {
+        try scribe.sbom.writeCycloneDX(out, bom);
+    }
 }
 
 fn writeJsonString(out: *Io.Writer, s: []const u8) !void {
