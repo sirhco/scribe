@@ -50,6 +50,11 @@ pub fn main(init: std.process.Init) !void {
     // TTY-aware ANSI styling. Off when piped, off when NO_COLOR is set.
     const style = scribe.term.Style.auto(io, init.minimal.environ);
 
+    // Inline progress reporter for long-running ops. No-op when stderr
+    // is not a TTY, so piped/scripted invocations stay byte-identical.
+    var prog = scribe.progress.Reporter.init(io, init.minimal.environ);
+    defer prog.deinit();
+
     const args = try init.minimal.args.toSlice(arena);
     if (args.len < 2) return die(stderr, usage, 1);
 
@@ -113,7 +118,10 @@ pub fn main(init: std.process.Init) !void {
         for (args[3..]) |a| {
             if (std.mem.eql(u8, a, "--plain")) plain = true;
         }
-        runSbom(io, gpa, stdout, args[2], plain, style) catch |err| return dieErr(stderr, err);
+        runSbom(io, gpa, stdout, args[2], plain, style, &prog) catch |err| {
+            prog.fail(@errorName(err));
+            return dieErr(stderr, err);
+        };
         return;
     }
     if (std.mem.eql(u8, cmd, "secrets")) {
@@ -159,7 +167,10 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         const db = db_path orelse return die(stderr, "error: 'vulns' requires --db <path>\n", 1);
-        runVulns(io, gpa, stdout, args[2], db, json, style) catch |err| return dieErr(stderr, err);
+        runVulns(io, gpa, stdout, args[2], db, json, style, &prog) catch |err| {
+            prog.fail(@errorName(err));
+            return dieErr(stderr, err);
+        };
         return;
     }
     if (std.mem.eql(u8, cmd, "config")) {
@@ -221,7 +232,10 @@ pub fn main(init: std.process.Init) !void {
                 return die(stderr, "error: unknown 'scan' option\n", 1);
             }
         }
-        runScan(io, gpa, stdout, args[2], db_path, config_path, fp_db_path, sec_opts, plain, style) catch |err| return dieErr(stderr, err);
+        runScan(io, gpa, stdout, args[2], db_path, config_path, fp_db_path, sec_opts, plain, style, &prog) catch |err| {
+            prog.fail(@errorName(err));
+            return dieErr(stderr, err);
+        };
         return;
     }
     if (std.mem.eql(u8, cmd, "vulndb")) {
@@ -257,7 +271,10 @@ pub fn main(init: std.process.Init) !void {
             }
             const url = from_url orelse return die(stderr, "error: vulndb update requires --from <url>\n", 1);
             const op = out_path orelse return die(stderr, "error: vulndb update requires --out <path>\n", 1);
-            runVulndbUpdate(io, gpa, stdout, url, op) catch |err| return dieErr(stderr, err);
+            runVulndbUpdate(io, gpa, stdout, url, op, &prog) catch |err| {
+                prog.fail(@errorName(err));
+                return dieErr(stderr, err);
+            };
             return;
         }
         return die(stderr, "error: vulndb <compile|update>\n", 1);
@@ -293,7 +310,10 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         const pp = policy_path orelse return die(stderr, "error: 'policy' requires --policy <path>\n", 1);
-        const code = runPolicy(io, gpa, stdout, args[2], pp, db_path, config_path, sec_opts, json, style) catch |err| return dieErr(stderr, err);
+        const code = runPolicy(io, gpa, stdout, args[2], pp, db_path, config_path, sec_opts, json, style, &prog) catch |err| {
+            prog.fail(@errorName(err));
+            return dieErr(stderr, err);
+        };
         stdout.flush() catch {};
         std.process.exit(code);
     }
@@ -445,17 +465,20 @@ fn runSbom(
     path: []const u8,
     plain: bool,
     style: scribe.term.Style,
+    prog: *scribe.progress.Reporter,
 ) !void {
     if (std.mem.startsWith(u8, path, "registry://")) {
-        var bom = try scribe.registry.pullSbom(gpa, io, path, .{});
+        var bom = try scribe.registry.pullSbom(gpa, io, path, .{ .progress = prog });
         defer bom.deinit(gpa);
+        prog.finish(null);
         try emitSbom(out, .{ .components = bom.components, .config_issues = bom.config_issues }, plain, style);
         return;
     }
 
     if (scribe.local_docker.isLocalDockerUri(path)) {
-        var bom = try scribe.local_docker.pullSbom(gpa, io, path);
+        var bom = try scribe.local_docker.pullSbomWithProgress(gpa, io, path, prog);
         defer bom.deinit(gpa);
+        prog.finish(null);
         try emitSbom(out, .{ .components = bom.components, .config_issues = bom.config_issues }, plain, style);
         return;
     }
@@ -465,8 +488,10 @@ fn runSbom(
     const bytes = mapping.bytes();
 
     if (scribe.container.isContainer(bytes)) {
+        prog.start("analyzing image layers");
         var bom = try scribe.container.collect(gpa, bytes);
         defer bom.deinit(gpa);
+        prog.finish(null);
         try emitSbom(out, .{ .components = bom.components, .config_issues = bom.config_issues }, plain, style);
     } else {
         var bom = try scribe.sbom.collect(gpa, bytes);
@@ -772,7 +797,9 @@ fn runVulns(
     db_path: []const u8,
     json: bool,
     style: scribe.term.Style,
+    prog: *scribe.progress.Reporter,
 ) !void {
+    prog.start("loading advisory db");
     var db_map = try scribe.mmap.open(io, db_path);
     defer db_map.deinit();
     var db = try scribe.security.vulnerability.load(gpa, db_map.bytes());
@@ -783,7 +810,7 @@ fn runVulns(
     // local docker images, and direct registry pulls.
     var bom: scribe.sbom.Sbom = blk: {
         if (std.mem.startsWith(u8, target_path, "registry://")) {
-            var img = try scribe.registry.pullSbom(gpa, io, target_path, .{});
+            var img = try scribe.registry.pullSbom(gpa, io, target_path, .{ .progress = prog });
             const s: scribe.sbom.Sbom = .{
                 .components = img.components,
                 .config_issues = img.config_issues,
@@ -793,7 +820,7 @@ fn runVulns(
             break :blk s;
         }
         if (scribe.local_docker.isLocalDockerUri(target_path)) {
-            var img = try scribe.local_docker.pullSbom(gpa, io, target_path);
+            var img = try scribe.local_docker.pullSbomWithProgress(gpa, io, target_path, prog);
             const s: scribe.sbom.Sbom = .{
                 .components = img.components,
                 .config_issues = img.config_issues,
@@ -806,6 +833,7 @@ fn runVulns(
         defer target.deinit();
         const bytes = target.bytes();
         if (scribe.container.isContainer(bytes)) {
+            prog.step("analyzing image layers");
             var img = try scribe.container.collect(gpa, bytes);
             const s: scribe.sbom.Sbom = .{
                 .components = img.components,
@@ -815,10 +843,12 @@ fn runVulns(
             img.config_issues = &.{};
             break :blk s;
         }
+        prog.step("collecting sbom");
         break :blk try scribe.sbom.collect(gpa, bytes);
     };
     defer bom.deinit(gpa);
 
+    prog.step("matching advisories");
     const refs = try gpa.alloc(scribe.security.vulnerability.ComponentRef, bom.components.len);
     defer gpa.free(refs);
     for (bom.components, 0..) |c, i| {
@@ -828,6 +858,7 @@ fn runVulns(
     var vulns = try scribe.security.vulnerability.match(gpa, refs, db);
     defer vulns.deinit(gpa);
 
+    prog.finish(null);
     if (json) {
         try emitVulnsJson(out, vulns);
     } else {
@@ -921,7 +952,9 @@ fn runScan(
     sec_opts: scribe.security.secrets.ScanOptions,
     plain: bool,
     style: scribe.term.Style,
+    prog: *scribe.progress.Reporter,
 ) !void {
+    prog.start("opening target");
     var target = try scribe.mmap.open(io, target_path);
     defer target.deinit();
     const bytes = target.bytes();
@@ -929,6 +962,7 @@ fn runScan(
     // Detect container vs binary target. Container path also auto-runs IaC
     // audit on embedded Dockerfiles / *.yaml / *.yml from the squashed layers.
     var bom: scribe.sbom.Sbom = if (scribe.container.isContainer(bytes)) blk: {
+        prog.step("analyzing image layers");
         var img = try scribe.container.collect(gpa, bytes);
         const s: scribe.sbom.Sbom = .{
             .components = img.components,
@@ -937,11 +971,15 @@ fn runScan(
         img.components = &.{};
         img.config_issues = &.{};
         break :blk s;
-    } else try scribe.sbom.collect(gpa, bytes);
+    } else cb: {
+        prog.step("collecting sbom");
+        break :cb try scribe.sbom.collect(gpa, bytes);
+    };
     defer bom.deinit(gpa);
 
     // Auto-enable wide-string scanning for PE targets — wide UTF-16LE
     // strings are the primary text-storage convention in Windows binaries.
+    prog.step("scanning secrets");
     var sec_opts_eff = sec_opts;
     if (bytes.len >= 2 and bytes[0] == 'M' and bytes[1] == 'Z') sec_opts_eff.scan_wide = true;
     var findings = try scribe.security.secrets.scan(gpa, bytes, sec_opts_eff);
@@ -951,9 +989,13 @@ fn runScan(
     // Fingerprint cross-ref: match function-byte fingerprints against the
     // corpus and append unique (lib, version) hits as Components evidenced
     // by `fingerprint`. Downstream vuln matcher then looks them up.
-    if (fp_db_path) |fp| try augmentBomWithFingerprint(io, gpa, bytes, fp, &bom);
+    if (fp_db_path) |fp| {
+        prog.step("matching fingerprints");
+        try augmentBomWithFingerprint(io, gpa, bytes, fp, &bom);
+    }
 
     if (db_path) |dp| {
+        prog.step("matching advisories");
         var db_map = try scribe.mmap.open(io, dp);
         defer db_map.deinit();
         var db = try scribe.security.vulnerability.load(gpa, db_map.bytes());
@@ -972,6 +1014,7 @@ fn runScan(
     // Explicit --config <path> appends issues alongside any auto-discovered
     // ones from the container layers.
     if (config_path) |cp| {
+        prog.step("auditing config");
         var cfg_map = try scribe.mmap.open(io, cp);
         defer cfg_map.deinit();
         var issues = try scribe.security.config.audit(gpa, cfg_map.bytes(), cp, .auto);
@@ -989,6 +1032,7 @@ fn runScan(
         }
     }
 
+    prog.finish(null);
     if (plain) {
         // Components header
         try writeSection(out, style, "components");
@@ -1206,7 +1250,9 @@ fn runPolicy(
     sec_opts: scribe.security.secrets.ScanOptions,
     json: bool,
     style: scribe.term.Style,
+    prog: *scribe.progress.Reporter,
 ) !u8 {
+    prog.start("loading policy");
     var policy_map = try scribe.mmap.open(io, policy_path);
     defer policy_map.deinit();
     var policy = try scribe.security.policy.Policy.loadJson(gpa, policy_map.bytes());
@@ -1217,6 +1263,7 @@ fn runPolicy(
     const bytes = target.bytes();
 
     var bom: scribe.sbom.Sbom = if (scribe.container.isContainer(bytes)) blk: {
+        prog.step("analyzing image layers");
         var img = try scribe.container.collect(gpa, bytes);
         const s: scribe.sbom.Sbom = .{
             .components = img.components,
@@ -1225,9 +1272,13 @@ fn runPolicy(
         img.components = &.{};
         img.config_issues = &.{};
         break :blk s;
-    } else try scribe.sbom.collect(gpa, bytes);
+    } else cb: {
+        prog.step("collecting sbom");
+        break :cb try scribe.sbom.collect(gpa, bytes);
+    };
     defer bom.deinit(gpa);
 
+    prog.step("scanning secrets");
     var sec_opts_eff = sec_opts;
     if (bytes.len >= 2 and bytes[0] == 'M' and bytes[1] == 'Z') sec_opts_eff.scan_wide = true;
     var findings = try scribe.security.secrets.scan(gpa, bytes, sec_opts_eff);
@@ -1235,6 +1286,7 @@ fn runPolicy(
     findings.items = &.{};
 
     if (db_path) |dp| {
+        prog.step("matching advisories");
         var db_map = try scribe.mmap.open(io, dp);
         defer db_map.deinit();
         var db = try scribe.security.vulnerability.load(gpa, db_map.bytes());
@@ -1248,6 +1300,7 @@ fn runPolicy(
     }
 
     if (config_path) |cp| {
+        prog.step("auditing config");
         var cfg_map = try scribe.mmap.open(io, cp);
         defer cfg_map.deinit();
         var issues = try scribe.security.config.audit(gpa, cfg_map.bytes(), cp, .auto);
@@ -1265,9 +1318,11 @@ fn runPolicy(
         }
     }
 
+    prog.step("evaluating policy");
     var result = try scribe.security.policy.evaluate(gpa, policy, bom);
     defer result.deinit(gpa);
 
+    prog.finish(null);
     if (json) {
         try emitPolicyJson(out, result);
     } else {
@@ -1441,6 +1496,7 @@ fn runVulndbUpdate(
     out: *Io.Writer,
     url: []const u8,
     out_path: []const u8,
+    prog: *scribe.progress.Reporter,
 ) !void {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
@@ -1448,6 +1504,7 @@ fn runVulndbUpdate(
     var body: std.Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
 
+    prog.stepf("fetching {s}", .{url});
     const result = client.fetch(.{
         .location = .{ .url = url },
         .response_writer = &body.writer,
@@ -1476,6 +1533,7 @@ fn runVulndbUpdate(
         return error.NotImplemented;
     }
 
+    prog.step("parsing advisories");
     const json_bytes = body.writer.buffered();
     var db = scribe.security.vulnerability.load(gpa, json_bytes) catch |err| {
         try out.print("error: advisory JSON parse failed: {s}\n", .{@errorName(err)});
@@ -1483,12 +1541,15 @@ fn runVulndbUpdate(
     };
     defer db.deinit(gpa);
 
+    prog.step("compiling .scvd");
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     try scribe.security.vulnerability.writeBinary(db, &aw.writer);
     const out_bytes = aw.written();
 
+    prog.stepf("writing {s}", .{out_path});
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = out_bytes });
+    prog.finish(null);
     try out.print(
         "fetched {d} advisories from {s}  ->  {s}  ({d} bytes)\n",
         .{ db.advisories.len, url, out_path, out_bytes.len },

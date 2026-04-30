@@ -18,6 +18,7 @@ const std = @import("std");
 const errors = @import("errors.zig");
 const container = @import("container.zig");
 const mmap_mod = @import("mmap.zig");
+const progress_mod = @import("progress.zig");
 
 pub const Error = error{
     DockerNotInstalled,
@@ -40,7 +41,7 @@ pub fn pullSbom(
     io: std.Io,
     uri: []const u8,
 ) Error!container.ImageSbom {
-    return pullSbomWithEnv(gpa, io, uri, null);
+    return pullSbomWithProgress(gpa, io, uri, null);
 }
 
 /// Compatibility shim — the env override is no longer consulted now that
@@ -53,6 +54,16 @@ pub fn pullSbomWithEnv(
     environ: ?std.process.Environ,
 ) Error!container.ImageSbom {
     _ = environ;
+    return pullSbomWithProgress(gpa, io, uri, null);
+}
+
+pub fn pullSbomWithProgress(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    uri: []const u8,
+    reporter: ?*progress_mod.Reporter,
+) Error!container.ImageSbom {
+    const prog = progress_mod.Handle.from(reporter);
     const image = parseImage(uri);
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -66,6 +77,7 @@ pub fn pullSbomWithEnv(
     // pathname doesn't free the bytes until we drop the mapping.
     defer std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
 
+    prog.stepf("docker save {s}", .{image});
     const argv = [_][]const u8{ "docker", "save", image };
     var child = std.process.spawn(io, .{
         .argv = &argv,
@@ -103,6 +115,7 @@ pub fn pullSbomWithEnv(
     };
     defer mapping.deinit();
 
+    prog.step("analyzing image layers");
     return try container.collect(gpa, mapping.bytes());
 }
 

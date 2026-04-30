@@ -37,6 +37,7 @@ const http = std.http;
 const errors = @import("errors.zig");
 const container = @import("container.zig");
 const sbom_mod = @import("sbom.zig");
+const progress_mod = @import("progress.zig");
 
 pub const Error = error{
     InvalidUri,
@@ -54,6 +55,8 @@ pub const PullOptions = struct {
     platform: []const u8 = nativePlatform(),
     /// Cap individual blob size to bound memory.
     max_blob_bytes: usize = 256 * 1024 * 1024,
+    /// Optional inline progress reporter; null disables UI.
+    progress: ?*progress_mod.Reporter = null,
 };
 
 const Reference = struct {
@@ -75,18 +78,20 @@ pub fn pullSbom(
 
     const ref = try parseRegistryUri(work, uri);
     const platform = ref.platform orelse options.platform;
+    const prog = progress_mod.Handle.from(options.progress);
 
     var client: http.Client = .{ .allocator = work, .io = io };
     defer client.deinit();
 
     // Step 1: anonymous bearer token (Docker Hub only). For other
     // registries the manifest endpoint may accept unauthenticated GETs.
-    const token = if (std.mem.endsWith(u8, ref.host, "docker.io"))
-        try fetchAnonymousToken(work, &client, ref.repo)
-    else
-        null;
+    const token = if (std.mem.endsWith(u8, ref.host, "docker.io")) blk: {
+        prog.step("authenticating with registry");
+        break :blk try fetchAnonymousToken(work, &client, ref.repo);
+    } else null;
 
     // Step 2: pull top-level manifest.
+    prog.stepf("fetching manifest {s}:{s}", .{ ref.repo, ref.tag });
     const top_url = try std.fmt.allocPrint(work, "https://{s}/v2/{s}/manifests/{s}", .{
         ref.host, ref.repo, ref.tag,
     });
@@ -98,10 +103,10 @@ pub fn pullSbom(
     const top_body = try fetchAuthorized(work, &client, top_url, accept_index, token, options.max_blob_bytes);
 
     // Step 3: if the top manifest is an index, pick the matching platform.
-    const image_manifest_bytes = if (looksLikeIndex(top_body))
-        try resolveIndex(work, &client, ref, token, platform, top_body, options)
-    else
-        top_body;
+    const image_manifest_bytes = if (looksLikeIndex(top_body)) idx: {
+        prog.stepf("resolving manifest list for {s}", .{platform});
+        break :idx try resolveIndex(work, &client, ref, token, platform, top_body, options);
+    } else top_body;
 
     // Step 4: parse image manifest, collect config + layer digests.
     const Image = struct {
@@ -116,6 +121,7 @@ pub fn pullSbom(
     // Step 5: fetch config + layer blobs into a map.
     var blobs: std.StringHashMap([]const u8) = .init(work);
     {
+        prog.step("fetching image config");
         const config_path = try std.fmt.allocPrint(work, "blobs/{s}", .{im.value.config.digest});
         const config_bytes = try fetchBlob(work, &client, ref, im.value.config.digest, token, options.max_blob_bytes);
         try blobs.put(config_path, config_bytes);
@@ -123,7 +129,9 @@ pub fn pullSbom(
 
     var layer_paths: std.ArrayList([]const u8) = .empty;
     defer layer_paths.deinit(work);
-    for (im.value.layers) |l| {
+    const total_layers = im.value.layers.len;
+    for (im.value.layers, 0..) |l, i| {
+        prog.stepf("fetching layer {d}/{d}", .{ i + 1, total_layers });
         const path = try std.fmt.allocPrint(work, "blobs/{s}", .{l.digest});
         const layer_bytes = try fetchBlob(work, &client, ref, l.digest, token, options.max_blob_bytes);
         try blobs.put(path, layer_bytes);
@@ -135,6 +143,7 @@ pub fn pullSbom(
     const manifest_json = try buildManifestJson(work, im.value.config.digest, layer_paths.items);
     try blobs.put("manifest.json", manifest_json);
 
+    prog.step("analyzing image layers");
     return container.collectFromBlobs(allocator, work, blobs);
 }
 
