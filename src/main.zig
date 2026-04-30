@@ -12,10 +12,11 @@ const usage =
     \\  scribe strings <path> [min]    printable ASCII runs (default min=4)
     \\  scribe entropy <path>          Shannon entropy per section
     \\  scribe sbom <path> [--plain]   bill of materials (CycloneDX 1.5 by default; --plain for human)
-    \\  scribe secrets <path> [opts]   SIMD secret scan ([--json] [--include-generic] [--min-entropy N])
+    \\  scribe secrets <path> [opts]   SIMD secret scan ([--json] [--include-generic] [--include-wide] [--min-entropy N])
     \\  scribe vulns <path> --db <p>   match SBOM components against advisory DB ([--json])
     \\  scribe config <path> [opts]    audit Dockerfile / k8s manifest ([--type dockerfile|kubernetes] [--json])
-    \\  scribe scan <path> [opts]      full pipeline: SBOM + secrets + vulns ([--db p] [--include-generic] [--plain])
+    \\  scribe scan <path> [opts]      full pipeline: SBOM + secrets + vulns + IaC + fingerprint
+    \\                                 ([--db p] [--config p] [--fp-db p] [--include-generic] [--include-wide] [--plain])
     \\  scribe policy <path> --policy <p>  evaluate scan results against policy ([--db d] [--config c] [--json]); exits 1 on fail
     \\  scribe vulndb compile <in.json> <out.scvd>      compile JSON advisory DB to mmap-friendly binary (.scvd)
     \\  scribe vulndb update --from <url> --out <p>     fetch advisory JSON over HTTPS, compile to .scvd
@@ -122,6 +123,8 @@ pub fn main(init: std.process.Init) !void {
                 json = true;
             } else if (std.mem.eql(u8, a, "--include-generic")) {
                 opts.include_generic = true;
+            } else if (std.mem.eql(u8, a, "--include-wide")) {
+                opts.scan_wide = true;
             } else if (std.mem.eql(u8, a, "--min-entropy")) {
                 if (idx + 1 >= args.len) return die(stderr, "error: --min-entropy requires a value\n", 1);
                 idx += 1;
@@ -182,6 +185,7 @@ pub fn main(init: std.process.Init) !void {
         var plain = false;
         var db_path: ?[]const u8 = null;
         var config_path: ?[]const u8 = null;
+        var fp_db_path: ?[]const u8 = null;
         var sec_opts: scribe.security.secrets.ScanOptions = .{};
         var idx: usize = 3;
         while (idx < args.len) : (idx += 1) {
@@ -190,6 +194,8 @@ pub fn main(init: std.process.Init) !void {
                 plain = true;
             } else if (std.mem.eql(u8, a, "--include-generic")) {
                 sec_opts.include_generic = true;
+            } else if (std.mem.eql(u8, a, "--include-wide")) {
+                sec_opts.scan_wide = true;
             } else if (std.mem.eql(u8, a, "--min-entropy")) {
                 if (idx + 1 >= args.len) return die(stderr, "error: --min-entropy requires a value\n", 1);
                 idx += 1;
@@ -203,11 +209,15 @@ pub fn main(init: std.process.Init) !void {
                 if (idx + 1 >= args.len) return die(stderr, "error: --config requires a path\n", 1);
                 idx += 1;
                 config_path = args[idx];
+            } else if (std.mem.eql(u8, a, "--fp-db")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --fp-db requires a path\n", 1);
+                idx += 1;
+                fp_db_path = args[idx];
             } else {
                 return die(stderr, "error: unknown 'scan' option\n", 1);
             }
         }
-        runScan(io, gpa, stdout, args[2], db_path, config_path, sec_opts, plain) catch |err| return dieErr(stderr, err);
+        runScan(io, gpa, stdout, args[2], db_path, config_path, fp_db_path, sec_opts, plain) catch |err| return dieErr(stderr, err);
         return;
     }
     if (std.mem.eql(u8, cmd, "vulndb")) {
@@ -766,6 +776,7 @@ fn runScan(
     target_path: []const u8,
     db_path: ?[]const u8,
     config_path: ?[]const u8,
+    fp_db_path: ?[]const u8,
     sec_opts: scribe.security.secrets.ScanOptions,
     plain: bool,
 ) !void {
@@ -787,9 +798,18 @@ fn runScan(
     } else try scribe.sbom.collect(gpa, bytes);
     defer bom.deinit(gpa);
 
-    var findings = try scribe.security.secrets.scan(gpa, bytes, sec_opts);
+    // Auto-enable wide-string scanning for PE targets — wide UTF-16LE
+    // strings are the primary text-storage convention in Windows binaries.
+    var sec_opts_eff = sec_opts;
+    if (bytes.len >= 2 and bytes[0] == 'M' and bytes[1] == 'Z') sec_opts_eff.scan_wide = true;
+    var findings = try scribe.security.secrets.scan(gpa, bytes, sec_opts_eff);
     bom.findings = findings.items; // ownership moves into Sbom.deinit
     findings.items = &.{};
+
+    // Fingerprint cross-ref: match function-byte fingerprints against the
+    // corpus and append unique (lib, version) hits as Components evidenced
+    // by `fingerprint`. Downstream vuln matcher then looks them up.
+    if (fp_db_path) |fp| try augmentBomWithFingerprint(io, gpa, bytes, fp, &bom);
 
     if (db_path) |dp| {
         var db_map = try scribe.mmap.open(io, dp);
@@ -975,7 +995,9 @@ fn runPolicy(
     } else try scribe.sbom.collect(gpa, bytes);
     defer bom.deinit(gpa);
 
-    var findings = try scribe.security.secrets.scan(gpa, bytes, sec_opts);
+    var sec_opts_eff = sec_opts;
+    if (bytes.len >= 2 and bytes[0] == 'M' and bytes[1] == 'Z') sec_opts_eff.scan_wide = true;
+    var findings = try scribe.security.secrets.scan(gpa, bytes, sec_opts_eff);
     bom.findings = findings.items;
     findings.items = &.{};
 
@@ -1126,6 +1148,65 @@ fn runVulndbUpdate(
         "fetched {d} advisories from {s}  ->  {s}  ({d} bytes)\n",
         .{ db.advisories.len, url, out_path, out_bytes.len },
     );
+}
+
+/// Run fingerprint.match against the target's function bytes using the
+/// fingerprint corpus at `fp_db_path`. Append one Component per unique
+/// (lib, version) pair to `bom.components` with evidence = .fingerprint.
+/// Existing components carrying the same lib are *not* deduplicated —
+/// the fingerprint hit acts as additional evidence of presence.
+fn augmentBomWithFingerprint(
+    io: Io,
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    fp_db_path: []const u8,
+    bom: *scribe.sbom.Sbom,
+) !void {
+    var fp_db_map = try scribe.mmap.open(io, fp_db_path);
+    defer fp_db_map.deinit();
+    var fp_db = try scribe.fingerprint.Database.parseJson(gpa, fp_db_map.bytes());
+    defer fp_db.deinit(gpa);
+
+    const hits = scribe.fingerprint.match(gpa, bytes, fp_db) catch return;
+    defer gpa.free(hits);
+    if (hits.len == 0) return;
+
+    // Dedupe by (lib, version).
+    const Pair = struct { lib: []const u8, version: ?[]const u8 };
+    var seen: std.ArrayList(Pair) = .empty;
+    defer seen.deinit(gpa);
+
+    var to_add: std.ArrayList(scribe.sbom.Component) = .empty;
+    errdefer {
+        for (to_add.items) |c| scribe.sbom.freeComponent(gpa, c);
+        to_add.deinit(gpa);
+    }
+
+    outer: for (hits) |h| {
+        for (seen.items) |s| {
+            if (!std.mem.eql(u8, s.lib, h.db_entry.lib)) continue;
+            const sv = s.version orelse "";
+            const hv = h.db_entry.version orelse "";
+            if (std.mem.eql(u8, sv, hv)) continue :outer;
+        }
+        try seen.append(gpa, .{ .lib = h.db_entry.lib, .version = h.db_entry.version });
+
+        try to_add.append(gpa, .{
+            .kind = .static_lib,
+            .name = try gpa.dupe(u8, h.db_entry.lib),
+            .version = if (h.db_entry.version) |v| try gpa.dupe(u8, v) else null,
+            .evidence = .fingerprint,
+        });
+    }
+
+    if (to_add.items.len == 0) return;
+
+    const merged = try gpa.alloc(scribe.sbom.Component, bom.components.len + to_add.items.len);
+    @memcpy(merged[0..bom.components.len], bom.components);
+    @memcpy(merged[bom.components.len..], to_add.items);
+    gpa.free(bom.components);
+    bom.components = merged;
+    to_add.items = &.{};
 }
 
 fn writeJsonString(out: *Io.Writer, s: []const u8) !void {

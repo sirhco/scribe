@@ -49,6 +49,9 @@ pub const ScanOptions = struct {
     min_entropy: f32 = 4.5,
     include_generic: bool = false,
     min_generic_len: usize = 20,
+    /// Also scan UTF-16LE wide strings (common in PE binaries: configs,
+    /// embedded credentials, hardcoded URLs in .NET assemblies).
+    scan_wide: bool = false,
 };
 
 pub const Findings = struct {
@@ -134,6 +137,9 @@ pub fn scan(
 
     try scanAnchors(allocator, bytes, &list);
     try scanContextualAwsSecret(allocator, bytes, &list);
+    if (opts.scan_wide) {
+        try scanWideAnchors(allocator, bytes, &list);
+    }
     if (opts.include_generic) {
         try scanGenericEntropy(allocator, bytes, opts, &list);
     }
@@ -315,6 +321,72 @@ fn findAwsSecretCandidate(window: []const u8) ?Run {
 
 fn isAwsSecretByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '/' or c == '+' or c == '=';
+}
+
+// ----------------------------------------------------------------------------
+// UTF-16LE wide-string anchor scan (opt-in via ScanOptions.scan_wide)
+//
+// Walks the buffer hunting runs where even-indexed bytes are ASCII printable
+// and odd-indexed bytes are 0x00. Reconstructs the ASCII byte stream into a
+// scratch buffer, runs the same pattern catalog as the byte-aligned anchor
+// scan, and reports findings with offsets pointing at the original wide-byte
+// position. Length is the wide-byte length (2 × ASCII length).
+//
+// Common in PE binaries (.rsrc strings, .NET resource sections,
+// pdb-embedded paths, hardcoded credentials in older toolchains).
+// ----------------------------------------------------------------------------
+
+inline fn isPrintableAscii(b: u8) bool {
+    return (b >= 0x20 and b <= 0x7E) or b == 0x09 or b == 0x0A;
+}
+
+fn scanWideAnchors(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    out: *std.ArrayList(Finding),
+) errors.ScribeError!void {
+    var temp: std.ArrayList(u8) = .empty;
+    defer temp.deinit(allocator);
+
+    var i: usize = 0;
+    while (i + 2 <= bytes.len) {
+        if (!isPrintableAscii(bytes[i]) or bytes[i + 1] != 0) {
+            i += 1;
+            continue;
+        }
+        const start = i;
+        temp.clearRetainingCapacity();
+        var j = i;
+        while (j + 2 <= bytes.len and isPrintableAscii(bytes[j]) and bytes[j + 1] == 0) : (j += 2) {
+            temp.append(allocator, bytes[j]) catch return error.OutOfMemory;
+        }
+        // Skip very short runs — same min_len gate as the byte scan.
+        if (temp.items.len >= 8) {
+            for (patterns) |pat| {
+                var k: usize = 0;
+                while (k + pat.prefix.len <= temp.items.len) : (k += 1) {
+                    if (temp.items[k] != pat.anchor) continue;
+                    if (!std.mem.eql(u8, temp.items[k..][0..pat.prefix.len], pat.prefix)) continue;
+                    const window_end = @min(temp.items.len, k + pat.max_total_len);
+                    if (pat.validate(temp.items[k..window_end])) |hit_len| {
+                        const slice = temp.items[k..][0..hit_len];
+                        const ent: f32 = @floatCast(entropy_mod.shannon(slice));
+                        const preview = try buildPreview(allocator, slice, ent);
+                        errdefer allocator.free(preview);
+                        out.append(allocator, .{
+                            .kind = pat.kind,
+                            .offset = start + @as(u64, k) * 2,
+                            .length = @intCast(hit_len * 2),
+                            .entropy = ent,
+                            .confidence = pat.base_confidence,
+                            .redacted_preview = preview,
+                        }) catch return error.OutOfMemory;
+                    }
+                }
+            }
+        }
+        i = j;
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -619,6 +691,35 @@ test "GCP service account literal detected" {
     var f = try scan(testing.allocator, data, .{});
     defer f.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), countByKind(f.items, .gcp_service_account));
+}
+
+test "scan_wide finds AKIA in UTF-16LE buffer" {
+    // Build wide-encoded "\x00AKIAIOSFODNN7EXAMPLE\x00" — each ASCII byte
+    // followed by 0x00. Pad with non-wide bytes so detector can't trigger
+    // via byte-aligned scan.
+    const ascii = "AKIAIOSFODNN7EXAMPLE";
+    var buf: [64]u8 = @splat(0xCC);
+    var w: usize = 4;
+    for (ascii) |c| {
+        buf[w] = c;
+        buf[w + 1] = 0;
+        w += 2;
+    }
+    @memset(buf[w..@min(w + 4, buf.len)], 0xCC);
+
+    var f = try scan(testing.allocator, buf[0 .. w + 4], .{ .scan_wide = true });
+    defer f.deinit(testing.allocator);
+    var found_aws = false;
+    for (f.items) |it| {
+        if (it.kind == .aws_access_key and it.length == 40) found_aws = true;
+    }
+    try testing.expect(found_aws);
+
+    // Without --include-wide, the same buffer should yield nothing
+    // (the byte-aligned scan can't see through the interleaved 0x00).
+    var f2 = try scan(testing.allocator, buf[0 .. w + 4], .{});
+    defer f2.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), f2.items.len);
 }
 
 test "AWS secret access key with context" {

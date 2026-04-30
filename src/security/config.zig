@@ -12,7 +12,7 @@ const errors = @import("../errors.zig");
 
 pub const Severity = enum { info, low, medium, high, critical };
 
-pub const Source = enum { dockerfile, kubernetes };
+pub const Source = enum { dockerfile, kubernetes, image_config };
 
 pub const Issue = struct {
     rule_id: []u8, // owned, e.g. "DKR001"
@@ -598,6 +598,145 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
 }
 
 // ----------------------------------------------------------------------------
+// OCI image-config audit
+//
+// Walks the parsed Config blob of a Docker / OCI image and flags effective
+// runtime hygiene problems:
+//   OCI001 — User missing / "root" / "0"               (high)
+//   OCI002 — Env contains a secret-like key=value pair (high)
+//   OCI003 — Healthcheck missing or set to NONE        (info)
+//   OCI004 — ExposedPorts includes SSH (22/tcp)        (medium)
+//
+// Rules complement the Dockerfile-text checks: image-config rules see the
+// final effective state after multi-stage builds and FROM inheritance,
+// which the Dockerfile-text rules can miss.
+// ----------------------------------------------------------------------------
+
+pub fn auditImageConfig(
+    allocator: std.mem.Allocator,
+    json_bytes: []const u8,
+    image_label: []const u8,
+) errors.ScribeError!Issues {
+    const Doc = struct {
+        config: ?struct {
+            User: ?[]const u8 = null,
+            Env: ?[]const []const u8 = null,
+            Cmd: ?[]const []const u8 = null,
+            Entrypoint: ?[]const []const u8 = null,
+            Healthcheck: ?struct {
+                Test: ?[]const []const u8 = null,
+            } = null,
+            ExposedPorts: ?std.json.ArrayHashMap(struct {}) = null,
+            Labels: ?std.json.ArrayHashMap([]const u8) = null,
+        } = null,
+    };
+
+    const parsed = std.json.parseFromSlice(Doc, allocator, json_bytes, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.NotImplemented;
+    defer parsed.deinit();
+
+    var list: std.ArrayList(Issue) = .empty;
+    errdefer {
+        for (list.items) |it| freeIssue(allocator, it);
+        list.deinit(allocator);
+    }
+
+    const cfg = parsed.value.config orelse return .{ .items = &.{} };
+
+    // OCI001: USER root / 0 / missing.
+    const user = cfg.User orelse "";
+    if (user.len == 0 or std.mem.eql(u8, user, "root") or
+        std.mem.eql(u8, user, "0") or std.mem.startsWith(u8, user, "0:"))
+    {
+        try addIssue(allocator, &list, .{
+            .rule_id = "OCI001",
+            .title = if (user.len == 0)
+                "image config has no USER (defaults to root)"
+            else
+                "image config USER is root / UID 0",
+            .severity = .high,
+            .source = .image_config,
+            .path = image_label,
+            .line = 0,
+            .snippet = user,
+            .recommendation = "Set Config.User to a non-zero UID in the final image layer.",
+        });
+    }
+
+    // OCI002: secret-like Env entries.
+    if (cfg.Env) |envs| {
+        for (envs) |entry| {
+            if (envLooksLikeSecret(entry)) {
+                try addIssue(allocator, &list, .{
+                    .rule_id = "OCI002",
+                    .title = "image config Env contains a secret-like value",
+                    .severity = .high,
+                    .source = .image_config,
+                    .path = image_label,
+                    .line = 0,
+                    .snippet = redactEnvEntry(entry),
+                    .recommendation = "Pass secrets at runtime (env file, secrets manager); never bake into the image.",
+                });
+            }
+        }
+    }
+
+    // OCI003: missing or disabled Healthcheck.
+    const hc_disabled = blk: {
+        const hc = cfg.Healthcheck orelse break :blk true;
+        const test_cmd = hc.Test orelse break :blk true;
+        if (test_cmd.len == 0) break :blk true;
+        if (std.mem.eql(u8, test_cmd[0], "NONE")) break :blk true;
+        break :blk false;
+    };
+    if (hc_disabled) {
+        try addIssue(allocator, &list, .{
+            .rule_id = "OCI003",
+            .title = "image has no HEALTHCHECK (or set to NONE)",
+            .severity = .info,
+            .source = .image_config,
+            .path = image_label,
+            .line = 0,
+            .snippet = "",
+            .recommendation = "Add a HEALTHCHECK so orchestrators can detect broken containers.",
+        });
+    }
+
+    // OCI004: SSH port exposed.
+    if (cfg.ExposedPorts) |ports| {
+        var it = ports.map.iterator();
+        while (it.next()) |kv| {
+            if (std.mem.startsWith(u8, kv.key_ptr.*, "22/")) {
+                try addIssue(allocator, &list, .{
+                    .rule_id = "OCI004",
+                    .title = "image exposes SSH port (22)",
+                    .severity = .medium,
+                    .source = .image_config,
+                    .path = image_label,
+                    .line = 0,
+                    .snippet = kv.key_ptr.*,
+                    .recommendation = "Drop ExposedPorts 22; SSH inside containers is an anti-pattern.",
+                });
+                break;
+            }
+        }
+    }
+
+    const items = list.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    return .{ .items = items };
+}
+
+/// Best-effort redaction of an `Env` entry to keep the secret value out of
+/// the snippet. Returns `KEY=<redacted>` for `KEY=...` form.
+fn redactEnvEntry(entry: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, entry, '=')) |i| {
+        return entry[0..i];
+    }
+    return entry;
+}
+
+// ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------
 
@@ -828,4 +967,62 @@ test "detectAndAudit content sniffs Dockerfile" {
     var r = try detectAndAudit(testing.allocator, df, "/repo/unnamed");
     defer r.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), r.items.len);
+}
+
+test "auditImageConfig: USER root + secret env + no healthcheck + ssh port" {
+    const cfg =
+        \\{
+        \\  "architecture": "amd64",
+        \\  "os": "linux",
+        \\  "config": {
+        \\    "User": "root",
+        \\    "Env": ["PATH=/usr/bin", "DB_PASSWORD=hunter2"],
+        \\    "ExposedPorts": {"22/tcp": {}, "80/tcp": {}},
+        \\    "Cmd": ["bash"]
+        \\  }
+        \\}
+    ;
+    var r = try auditImageConfig(testing.allocator, cfg, "image:tag");
+    defer r.deinit(testing.allocator);
+    try testing.expect(hasRule(r.items, "OCI001"));
+    try testing.expect(hasRule(r.items, "OCI002"));
+    try testing.expect(hasRule(r.items, "OCI003"));
+    try testing.expect(hasRule(r.items, "OCI004"));
+}
+
+test "auditImageConfig: clean config" {
+    const cfg =
+        \\{
+        \\  "config": {
+        \\    "User": "1000:1000",
+        \\    "Env": ["PATH=/usr/bin"],
+        \\    "ExposedPorts": {"8080/tcp": {}},
+        \\    "Healthcheck": {"Test": ["CMD", "/healthz"]}
+        \\  }
+        \\}
+    ;
+    var r = try auditImageConfig(testing.allocator, cfg, "image:tag");
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), r.items.len);
+}
+
+test "auditImageConfig: env redaction strips value from snippet" {
+    const cfg =
+        \\{
+        \\  "config": {
+        \\    "User": "1000",
+        \\    "Env": ["AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"],
+        \\    "Healthcheck": {"Test": ["CMD", "true"]}
+        \\  }
+        \\}
+    ;
+    var r = try auditImageConfig(testing.allocator, cfg, "image");
+    defer r.deinit(testing.allocator);
+    try testing.expect(hasRule(r.items, "OCI002"));
+    for (r.items) |it| {
+        if (std.mem.eql(u8, it.rule_id, "OCI002")) {
+            try testing.expect(std.mem.indexOf(u8, it.snippet, "wJalr") == null);
+            try testing.expect(std.mem.indexOf(u8, it.snippet, "EXAMPLEKEY") == null);
+        }
+    }
 }

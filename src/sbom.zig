@@ -27,6 +27,10 @@ pub const Evidence = enum {
     build_id,
     dynamic_link,
     embedded_string,
+    /// Function-byte fingerprint match against a corpus DB (Wyhash over
+    /// function bodies). Stronger than embedded_string because it survives
+    /// `strip(1)` but does require the binary to have DWARF/symtab present.
+    fingerprint,
 };
 
 pub const Component = struct {
@@ -502,6 +506,7 @@ fn evidenceConfidence(e: Evidence) f32 {
     return switch (e) {
         .build_id => 1.0,
         .dynamic_link => 0.9,
+        .fingerprint => 0.85,
         .embedded_string => 0.6,
     };
 }

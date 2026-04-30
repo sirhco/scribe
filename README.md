@@ -21,6 +21,7 @@ Scribe is the static analysis foundation for [Scribe Live](../scribe-live), the 
   - [`scribe addr2line`](#scribe-addr2line-path-hex) — address → source location
   - [`scribe fp generate`](#scribe-fp-generate-path-lib-version) — fingerprint database
   - [`scribe fp match`](#scribe-fp-match-target-dbjson) — fingerprint match
+- [Security pipeline](#security-pipeline) (`secrets`, `vulns`, `config`, `scan`, `policy`, `vulndb`) — see [SECURITY.md](SECURITY.md) for the full reference
 - [Library usage (Zig)](#library-usage-zig)
 - [Source ingestion: file, container, registry](#source-ingestion-file-container-registry)
 - [Format support matrix](#format-support-matrix)
@@ -41,8 +42,12 @@ Scribe is the static analysis foundation for [Scribe Live](../scribe-live), the 
 | 3c    | Container SBOM (docker save tar, layer squash with whiteouts)      | done  |
 | 3d    | Direct OCI registry pull (no docker daemon, multi-arch)            | done  |
 | 4a    | DWARF symbolication                                                | done  |
+| 5a    | Security: SIMD secret scan (anchored + UTF-16LE + entropy)         | done  |
+| 5b    | Security: vuln matcher (OSV-lite + OSV native + binary `.scvd`)    | done  |
+| 5c    | Security: IaC audit (Dockerfile + Kubernetes + OCI image-config)   | done  |
+| 5d    | Security: policy gate, fingerprint cross-ref, `scribe scan` umbrella | done  |
 
-Tests: 48 unit + integration tests (`zig build test`).
+Tests: 120 unit + integration tests (`zig build test`).
 
 ---
 
@@ -292,6 +297,36 @@ where DT_NEEDED and embedded version strings are absent.
 
 ---
 
+### Security pipeline
+
+scribe ships a daemon-free, no-Go-deps security scanner built on the same
+zero-copy primitives as the SBOM stack. Six subcommands cover secret
+scanning, CVE matching, IaC audit, policy gates, and advisory-DB
+management:
+
+```bash
+scribe secrets ./myapp                                 # SIMD anchored + UTF-16LE secret scan
+scribe vulns   ./myapp --db osv.scvd                   # CVE matcher
+scribe config  ./Dockerfile                            # IaC misconfig audit (Dockerfile / k8s / OCI image-config)
+scribe scan    ./myapp --db osv.scvd --config Dockerfile --fp-db corpus.json   # full pipeline
+scribe policy  ./myapp --policy ci.json --db osv.scvd  # exits 1 on violation; CI-friendly
+scribe vulndb  compile osv-lite.json osv.scvd          # JSON → mmap binary
+scribe vulndb  update  --from <url> --out osv.scvd     # HTTPS fetch + compile
+```
+
+All security signals merge into a single CycloneDX 1.5 SBOM with
+`components[]`, `properties[]` (secrets + IaC findings), and
+`vulnerabilities[]`. Container targets (`docker save` tar,
+`registry://`, `docker://`) auto-discover embedded Dockerfiles / YAMLs
+and audit the OCI image config blob.
+
+See [**SECURITY.md**](SECURITY.md) for: subcommand reference, JSON
+formats (OSV-lite, OSV native, SCVD binary spec, policy.json), full
+rule catalog (`DKR###`, `K8S###`, `OCI###`), the secret pattern table,
+performance notes, and CI integration examples.
+
+---
+
 ## Library usage (Zig)
 
 Add scribe as a dependency, then import it:
@@ -343,6 +378,10 @@ Module surface:
 | `scribe.registry`   | Direct HTTPS pull from OCI registries                          |
 | `scribe.dwarf`      | `Symbolicator` over `.debug_info`/`.debug_line`                |
 | `scribe.fingerprint`| Wyhash function-signature corpus + matcher                     |
+| `scribe.security.secrets`     | SIMD anchored + UTF-16LE + entropy secret scanner    |
+| `scribe.security.vulnerability` | Advisory matcher (OSV-lite, OSV native, SCVD binary) |
+| `scribe.security.config`      | IaC audit (Dockerfile, Kubernetes, OCI image-config) |
+| `scribe.security.policy`      | JSON-driven gatekeeper over a populated `Sbom`       |
 
 All public APIs allocate via the caller's allocator; no implicit globals.
 `*Info` and `Sbom` types own their string buffers and require explicit

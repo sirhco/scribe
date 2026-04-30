@@ -91,6 +91,22 @@ pub fn collectFromBlobs(
         const platform_tag = readPlatform(work, outer, entry.Config) catch
             try work.dupe(u8, "linux/unknown");
 
+        // Audit the OCI image config blob for runtime hygiene problems
+        // (USER=root, secret-like Env, no HEALTHCHECK, exposed SSH).
+        if (outer.get(entry.Config)) |cfg_bytes| {
+            const tag_label = if (entry.RepoTags) |tags|
+                (if (tags.len > 0) tags[0] else entry.Config)
+            else
+                entry.Config;
+            var img_issues = security_config.auditImageConfig(allocator, cfg_bytes, tag_label) catch
+                security_config.Issues{ .items = &.{} };
+            for (img_issues.items) |is| {
+                config_issues.append(allocator, is) catch return error.OutOfMemory;
+            }
+            if (img_issues.items.len != 0) allocator.free(img_issues.items);
+            img_issues.items = &.{};
+        }
+
         var squash: std.StringHashMap([]u8) = .init(work);
         for (entry.Layers) |layer_path| {
             const layer_bytes = outer.get(layer_path) orelse return error.LayerMissing;
