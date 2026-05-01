@@ -107,11 +107,19 @@ const Category = enum {
 // ---- item ------------------------------------------------------------------
 
 const Item = struct {
-    title: []const u8,
+    title_plain: []const u8,
+    title_marked: []const u8, // "★ " + title_plain
     title_style: Style,
     detail: []const Segment,
     category: Category,
+    bookmarked: bool = false,
+
+    fn currentTitle(self: *const Item) []const u8 {
+        return if (self.bookmarked) self.title_marked else self.title_plain;
+    }
 };
+
+const Mode = enum { normal, search };
 
 // ---- tab bar widget --------------------------------------------------------
 
@@ -203,6 +211,69 @@ fn asciiCell(s: []const u8) []const u8 {
     return Static.table[idx][0..];
 }
 
+// ---- status bar widget -----------------------------------------------------
+
+const StatusBar = struct {
+    state: *Root,
+
+    fn widget(self: *StatusBar) vxfw.Widget {
+        return .{
+            .userdata = self,
+            .drawFn = drawFn,
+        };
+    }
+
+    fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
+        const self: *StatusBar = @ptrCast(@alignCast(ptr));
+        const max = ctx.max.size();
+        const size: vxfw.Size = .{ .width = max.width, .height = 1 };
+        const surface = try vxfw.Surface.init(ctx.arena, self.widget(), size);
+        @memset(surface.buffer, .{ .style = .{} });
+
+        var col: u16 = 0;
+        if (self.state.mode == .search) {
+            col = writeRun(surface, col, "/", .{ .fg = palette.heading, .bold = true });
+            col = writeRun(surface, col, self.state.query_buf[0..self.state.query_len], .{ .fg = palette.fg, .bold = true });
+            col = writeRun(surface, col, "_", .{ .fg = palette.heading, .bold = true });
+            col = writeRun(surface, col, "  (Enter confirm · Esc cancel)", .{ .fg = palette.dim, .italic = true });
+        } else if (self.state.status_len > 0) {
+            const msg = self.state.status_buf[0..self.state.status_len];
+            col = writeRun(surface, col, msg, .{ .fg = palette.ok, .bold = true });
+        } else {
+            col = writeRun(surface, col, " q ", .{ .fg = palette.dim });
+            col = writeRun(surface, col, "quit  ", .{ .fg = palette.fg });
+            col = writeRun(surface, col, "/ ", .{ .fg = palette.dim });
+            col = writeRun(surface, col, "search  ", .{ .fg = palette.fg });
+            col = writeRun(surface, col, "b ", .{ .fg = palette.dim });
+            col = writeRun(surface, col, "bookmark  ", .{ .fg = palette.fg });
+            col = writeRun(surface, col, "e ", .{ .fg = palette.dim });
+            col = writeRun(surface, col, "export  ", .{ .fg = palette.fg });
+            col = writeRun(surface, col, "y ", .{ .fg = palette.dim });
+            col = writeRun(surface, col, "yank  ", .{ .fg = palette.fg });
+            if (self.state.query_len > 0) {
+                col = writeRun(surface, col, "│  ", .{ .fg = palette.dim });
+                col = writeRun(surface, col, "filter: /", .{ .fg = palette.heading });
+                col = writeRun(surface, col, self.state.query_buf[0..self.state.query_len], .{ .fg = palette.heading, .bold = true });
+            }
+            const bookmark_count = countBookmarks(self.state.items);
+            if (bookmark_count > 0) {
+                var nb: [32]u8 = undefined;
+                const s = std.fmt.bufPrint(&nb, "  ★{d}", .{bookmark_count}) catch "";
+                col = writeRun(surface, col, s, .{ .fg = palette.heading });
+            }
+        }
+        return surface;
+    }
+};
+
+fn countBookmarks(items: []const Item) usize {
+    var n: usize = 0;
+    for (items) |it| if (it.bookmarked) {
+        n += 1;
+    };
+    return n;
+}
+
 // ---- root widget -----------------------------------------------------------
 
 const Root = struct {
@@ -210,9 +281,10 @@ const Root = struct {
     split: *vxfw.SplitView,
     detail: *vxfw.RichText,
     tabbar: *TabBar,
+    statusbar: *StatusBar,
     flex: *vxfw.FlexColumn,
 
-    items: []const Item,
+    items: []Item,
     /// list_widgets is a buffer sized to items.len; we slice into it when
     /// the filter changes and rebind list.children.
     list_widgets_buf: []vxfw.Widget,
@@ -223,6 +295,18 @@ const Root = struct {
 
     filter: Filter = .all,
     counts: [5]usize,
+
+    mode: Mode = .normal,
+    query_buf: [128]u8 = undefined,
+    query_len: usize = 0,
+
+    status_buf: [256]u8 = undefined,
+    status_len: usize = 0,
+
+    /// Allocator we use to write export files etc.
+    gpa: Allocator,
+    /// Path the user pointed scribe at — embedded in export header.
+    source_path: []const u8,
 
     fn widget(self: *Root) vxfw.Widget {
         return .{
@@ -236,6 +320,12 @@ const Root = struct {
         const self: *Root = @ptrCast(@alignCast(ptr));
         switch (event) {
             .key_press => |key| {
+                if (self.mode == .search) return self.handleSearchKey(ctx, key);
+
+                // Any key in normal mode clears the transient status banner
+                // (so the next render shows the regular hint line).
+                self.status_len = 0;
+
                 if (key.matches('q', .{}) or
                     key.matches('c', .{ .ctrl = true }) or
                     key.matches(vaxis.Key.escape, .{}))
@@ -244,6 +334,10 @@ const Root = struct {
                     ctx.consume_event = true;
                     return;
                 }
+                if (key.matches('/', .{})) return self.enterSearch(ctx);
+                if (key.matches('b', .{})) return self.toggleBookmark(ctx);
+                if (key.matches('e', .{})) return self.exportBookmarks(ctx);
+                if (key.matches('y', .{})) return self.yankDetail(ctx);
                 if (key.matches('1', .{})) return self.setFilter(ctx, .all);
                 if (key.matches('2', .{})) return self.setFilter(ctx, .components);
                 if (key.matches('3', .{})) return self.setFilter(ctx, .secrets);
@@ -259,6 +353,123 @@ const Root = struct {
             },
             else => try self.list.handleEvent(ctx, event),
         }
+    }
+
+    fn handleSearchKey(self: *Root, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            // Cancel: clear query, exit search mode.
+            self.query_len = 0;
+            self.mode = .normal;
+            self.applyFilter();
+            self.list.cursor = 0;
+            self.list.scroll = .{};
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            // Confirm: keep query, exit search mode.
+            self.mode = .normal;
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            if (self.query_len > 0) {
+                self.query_len -= 1;
+                self.applyFilter();
+                self.list.cursor = 0;
+                self.list.scroll = .{};
+            }
+            ctx.consumeAndRedraw();
+            return;
+        }
+        // Take printable text from the key event. Kitty extension reports
+        // .text; fall back to the raw codepoint when that's absent.
+        const text = key.text orelse blk: {
+            if (key.codepoint >= 0x20 and key.codepoint < 0x7F) {
+                self.query_buf[0] = @intCast(key.codepoint);
+                break :blk self.query_buf[0..1];
+            }
+            ctx.consume_event = true;
+            return;
+        };
+        for (text) |b| {
+            if (b < 0x20 or b == 0x7F) continue;
+            if (self.query_len >= self.query_buf.len) break;
+            self.query_buf[self.query_len] = b;
+            self.query_len += 1;
+        }
+        self.applyFilter();
+        self.list.cursor = 0;
+        self.list.scroll = .{};
+        ctx.consumeAndRedraw();
+    }
+
+    fn enterSearch(self: *Root, ctx: *vxfw.EventContext) void {
+        self.mode = .search;
+        self.query_len = 0;
+        self.applyFilter();
+        self.list.cursor = 0;
+        ctx.consumeAndRedraw();
+    }
+
+    fn toggleBookmark(self: *Root, ctx: *vxfw.EventContext) void {
+        const idx = self.list.cursor;
+        if (idx >= self.item_index_map.len) {
+            ctx.consume_event = true;
+            return;
+        }
+        const item_idx = self.item_index_map[idx];
+        self.items[item_idx].bookmarked = !self.items[item_idx].bookmarked;
+        // Refresh the visible row's title without changing selection.
+        self.list_text_buf[item_idx].text = self.items[item_idx].currentTitle();
+        ctx.consumeAndRedraw();
+    }
+
+    fn exportBookmarks(self: *Root, ctx: *vxfw.EventContext) void {
+        const out_path = ".scribe-bookmarks.md";
+        var aw: std.Io.Writer.Allocating = .init(self.gpa);
+        defer aw.deinit();
+        const w = &aw.writer;
+        w.print("# scribe bookmarks\n\nsource: `{s}`\n\n", .{self.source_path}) catch {};
+        var n: usize = 0;
+        for (self.items) |it| {
+            if (!it.bookmarked) continue;
+            n += 1;
+            w.print("## {s}\n\n", .{it.title_plain}) catch {};
+            for (it.detail) |seg| w.writeAll(seg.text) catch {};
+            w.writeAll("\n---\n\n") catch {};
+        }
+        const bytes = aw.written();
+        Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = out_path, .data = bytes }) catch |err| {
+            self.setStatus("export failed: {s}", .{@errorName(err)});
+            ctx.consumeAndRedraw();
+            return;
+        };
+        self.setStatus("✓ exported {d} bookmarks → {s}", .{ n, out_path });
+        ctx.consumeAndRedraw();
+    }
+
+    fn yankDetail(self: *Root, ctx: *vxfw.EventContext) void {
+        const it = self.currentItem() orelse {
+            ctx.consume_event = true;
+            return;
+        };
+        // Concatenate spans into a flat plain-text payload and ship it.
+        var aw: std.Io.Writer.Allocating = .init(ctx.alloc);
+        defer aw.deinit();
+        for (it.detail) |seg| aw.writer.writeAll(seg.text) catch {};
+        ctx.copyToClipboard(aw.written()) catch |err| {
+            self.setStatus("copy failed: {s}", .{@errorName(err)});
+            ctx.consumeAndRedraw();
+            return;
+        };
+        self.setStatus("✓ copied detail to clipboard ({d} bytes)", .{aw.written().len});
+        ctx.consumeAndRedraw();
+    }
+
+    fn setStatus(self: *Root, comptime fmt: []const u8, args: anytype) void {
+        const msg = std.fmt.bufPrint(&self.status_buf, fmt, args) catch self.status_buf[0..0];
+        self.status_len = msg.len;
     }
 
     fn cycleFilter(self: *Root, ctx: *vxfw.EventContext, dir: i8) void {
@@ -281,9 +492,13 @@ const Root = struct {
     }
 
     fn applyFilter(self: *Root) void {
+        const query = self.query_buf[0..self.query_len];
         var n: usize = 0;
-        for (self.items, 0..) |it, i| {
+        for (self.items, 0..) |*it, i| {
             if (!self.filter.includes(it.category)) continue;
+            if (query.len > 0 and !matchQuery(it.title_plain, query) and it.category != .summary) continue;
+            // Refresh the rendered title (★-prefix follows bookmark state).
+            self.list_text_buf[i].text = it.currentTitle();
             self.list_widgets_buf[n] = self.list_text_buf[i].widget();
             self.item_index_map[n] = i;
             n += 1;
@@ -323,6 +538,23 @@ const Root = struct {
         );
     }
 };
+
+fn matchQuery(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var ok = true;
+        for (needle, 0..) |nb, j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(nb)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return true;
+    }
+    return false;
+}
 
 const empty_detail = [_]Segment{
     .{ .text = "(no items)", .style = .{ .fg = palette.dim, .italic = true } },
@@ -367,7 +599,7 @@ pub fn run(
     const item_index_map = try work.alloc(usize, items.len);
     for (items, 0..) |it, i| {
         list_text_buf[i] = .{
-            .text = it.title,
+            .text = it.title_plain,
             .style = it.title_style,
             .softwrap = false,
             .overflow = .ellipsis,
@@ -390,7 +622,6 @@ pub fn run(
         .style = .{ .fg = palette.dim },
         .labels = &.{
             .{ .text = " detail ", .alignment = .top_left },
-            .{ .text = " q quit · ↑↓ nav · 1-5 filter · Tab cycle ", .alignment = .bottom_right },
         },
     };
 
@@ -417,20 +648,26 @@ pub fn run(
         .split = &split,
         .detail = &detail_text,
         .tabbar = undefined,
+        .statusbar = undefined,
         .flex = undefined,
         .items = items,
         .list_widgets_buf = list_widgets_buf,
         .list_text_buf = list_text_buf,
         .item_index_map = item_index_map,
         .counts = counts,
+        .gpa = gpa,
+        .source_path = source_path,
     };
 
     var tabbar: TabBar = .{ .state = &root };
     root.tabbar = &tabbar;
+    var statusbar: StatusBar = .{ .state = &root };
+    root.statusbar = &statusbar;
 
-    const flex_children = try work.alloc(vxfw.FlexItem, 2);
+    const flex_children = try work.alloc(vxfw.FlexItem, 3);
     flex_children[0] = .{ .widget = tabbar.widget(), .flex = 0 };
     flex_children[1] = .{ .widget = split.widget(), .flex = 1 };
+    flex_children[2] = .{ .widget = statusbar.widget(), .flex = 0 };
     var flex: vxfw.FlexColumn = .{ .children = flex_children };
     root.flex = &flex;
 
@@ -671,7 +908,8 @@ fn buildItems(arena: Allocator, bom: *const scribe.sbom.Sbom, source: []const u8
             .{ .text = "Use 1-5 to filter. Tab cycles. q to quit.\n", .style = .{ .fg = palette.dim, .italic = true } },
         });
         try list.append(arena, .{
-            .title = title,
+            .title_plain = title,
+            .title_marked = "",
             .title_style = .{ .bold = true, .fg = palette.heading },
             .detail = detail,
             .category = .summary,
@@ -680,7 +918,8 @@ fn buildItems(arena: Allocator, bom: *const scribe.sbom.Sbom, source: []const u8
 
     if (bom.components.len > 0) {
         try list.append(arena, .{
-            .title = try std.fmt.allocPrint(arena, "── components ({d}) ──", .{bom.components.len}),
+            .title_plain = try std.fmt.allocPrint(arena, "── components ({d}) ──", .{bom.components.len}),
+            .title_marked = "",
             .title_style = .{ .bold = true, .fg = palette.accent, .dim = true },
             .detail = try componentsHeaderDetail(arena, bom.components.len),
             .category = .heading_components,
@@ -708,7 +947,8 @@ fn buildItems(arena: Allocator, bom: *const scribe.sbom.Sbom, source: []const u8
                 .{ .text = "\n", .style = .{} },
             });
             try list.append(arena, .{
-                .title = title,
+                .title_plain = title,
+            .title_marked = "",
                 .title_style = .{ .fg = palette.fg },
                 .detail = detail,
                 .category = .component,
@@ -718,7 +958,8 @@ fn buildItems(arena: Allocator, bom: *const scribe.sbom.Sbom, source: []const u8
 
     if (bom.findings.len > 0) {
         try list.append(arena, .{
-            .title = try std.fmt.allocPrint(arena, "── secrets ({d}) ──", .{bom.findings.len}),
+            .title_plain = try std.fmt.allocPrint(arena, "── secrets ({d}) ──", .{bom.findings.len}),
+            .title_marked = "",
             .title_style = .{ .bold = true, .fg = palette.accent, .dim = true },
             .detail = try arena.dupe(Segment, &[_]Segment{
                 .{ .text = "secret findings\n\n", .style = .{ .bold = true, .fg = palette.heading } },
@@ -751,7 +992,8 @@ fn buildItems(arena: Allocator, bom: *const scribe.sbom.Sbom, source: []const u8
                 .{ .text = "\n", .style = .{} },
             });
             try list.append(arena, .{
-                .title = title,
+                .title_plain = title,
+            .title_marked = "",
                 .title_style = .{ .fg = palette.secret_kind },
                 .detail = detail,
                 .category = .secret,
@@ -761,7 +1003,8 @@ fn buildItems(arena: Allocator, bom: *const scribe.sbom.Sbom, source: []const u8
 
     if (bom.vulnerabilities.len > 0) {
         try list.append(arena, .{
-            .title = try std.fmt.allocPrint(arena, "── vulnerabilities ({d}) ──", .{bom.vulnerabilities.len}),
+            .title_plain = try std.fmt.allocPrint(arena, "── vulnerabilities ({d}) ──", .{bom.vulnerabilities.len}),
+            .title_marked = "",
             .title_style = .{ .bold = true, .fg = palette.accent, .dim = true },
             .detail = try arena.dupe(Segment, &[_]Segment{
                 .{ .text = "vulnerabilities\n\n", .style = .{ .bold = true, .fg = palette.heading } },
@@ -797,7 +1040,8 @@ fn buildItems(arena: Allocator, bom: *const scribe.sbom.Sbom, source: []const u8
                 .{ .text = "\n", .style = .{} },
             });
             try list.append(arena, .{
-                .title = title,
+                .title_plain = title,
+            .title_marked = "",
                 .title_style = .{ .fg = sev_color },
                 .detail = detail,
                 .category = .vulnerability,
@@ -807,7 +1051,8 @@ fn buildItems(arena: Allocator, bom: *const scribe.sbom.Sbom, source: []const u8
 
     if (bom.config_issues.len > 0) {
         try list.append(arena, .{
-            .title = try std.fmt.allocPrint(arena, "── config issues ({d}) ──", .{bom.config_issues.len}),
+            .title_plain = try std.fmt.allocPrint(arena, "── config issues ({d}) ──", .{bom.config_issues.len}),
+            .title_marked = "",
             .title_style = .{ .bold = true, .fg = palette.accent, .dim = true },
             .detail = try arena.dupe(Segment, &[_]Segment{
                 .{ .text = "configuration issues\n\n", .style = .{ .bold = true, .fg = palette.heading } },
@@ -849,7 +1094,8 @@ fn buildItems(arena: Allocator, bom: *const scribe.sbom.Sbom, source: []const u8
                 .{ .text = "\n", .style = .{} },
             });
             try list.append(arena, .{
-                .title = title,
+                .title_plain = title,
+            .title_marked = "",
                 .title_style = .{ .fg = sev_color },
                 .detail = detail,
                 .category = .config,
@@ -857,7 +1103,12 @@ fn buildItems(arena: Allocator, bom: *const scribe.sbom.Sbom, source: []const u8
         }
     }
 
-    return list.toOwnedSlice(arena);
+    const items = try list.toOwnedSlice(arena);
+    // Pre-build "★ "-prefixed title for each item (used when bookmarked).
+    for (items) |*it| {
+        it.title_marked = try std.fmt.allocPrint(arena, "★ {s}", .{it.title_plain});
+    }
+    return items;
 }
 
 fn componentsHeaderDetail(arena: Allocator, n: usize) ![]const Segment {
