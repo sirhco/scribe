@@ -1,6 +1,6 @@
 # Scribe
 
-Scribe is a high-performance, cross-platform binary forensics library and CLI written in Zig. It parses ELF, Mach-O, and PE binaries with zero-copy techniques, extracts dynamic dependencies and DWARF symbols, computes per-section Shannon entropy, recovers strings via SIMD, fingerprints functions for static-library identification, and weaves Software Bills of Materials (SBOMs) for both individual binaries and full container images — including direct OCI registry pulls without a Docker daemon.
+Scribe is a high-performance, cross-platform binary forensics library and CLI written in Zig. It parses ELF, Mach-O, and PE binaries with zero-copy techniques, extracts dynamic dependencies and DWARF symbols, computes per-section Shannon entropy, recovers strings via SIMD, fingerprints functions for static-library identification, and weaves Software Bills of Materials (SBOMs) for both individual binaries and full container images — including direct OCI registry pulls without a Docker daemon. Long-running operations (`registry://` pulls, container squash, `scan`, `vulndb update`) emit an inline ANSI spinner on stderr when attached to a TTY; piped/JSON/scripted invocations stay byte-identical to before. An interactive results browser ([`scribe ui`](#scribe-ui-source-opts)) built on [libvaxis](https://rockorager.github.io/libvaxis/) provides a tabbed two-pane TUI over the same scan pipeline with multi-select, bookmarks, search, clipboard yank, and incremental export-diff.
 
 ---
 
@@ -19,6 +19,7 @@ Scribe is a high-performance, cross-platform binary forensics library and CLI wr
   - [`scribe addr2line`](#scribe-addr2line-path-hex) — address → source location
   - [`scribe fp generate`](#scribe-fp-generate-path-lib-version) — fingerprint database
   - [`scribe fp match`](#scribe-fp-match-target-dbjson) — fingerprint match
+  - [`scribe ui`](#scribe-ui-source-opts) — interactive scan-results browser (TUI)
 - [Security pipeline](#security-pipeline) (`secrets`, `vulns`, `config`, `scan`, `policy`, `vulndb`) — see [SECURITY.md](SECURITY.md) for the full reference
 - [Library usage (Zig)](#library-usage-zig)
 - [Source ingestion: file, container, registry](#source-ingestion-file-container-registry)
@@ -49,6 +50,8 @@ Scribe is a high-performance, cross-platform binary forensics library and CLI wr
 | 5e-ext | IaC audit driven by an AST YAML walker (multi-doc, anchors/aliases, merge keys (`<<:`), YAML 1.1 booleans, block + flow style, Helm `{{ ... }}` tolerated) | done |
 | 3b-ext | Sliding-window fingerprint match (stripped binaries) + x86_64 relocation-normalized hashes (E8/E9/0F8x branches, RIP-relative ModR/M loads/stores/LEAs/indirect calls) | done |
 | 3c-ext | `docker save` stdout spooled straight to a tempfile (no in-memory cap); outer-tar walk is zero-copy via mmap so resident memory tracks the working set, not the image size | done |
+| 6      | Inline progress reporter — TTY-gated ANSI spinner + status label on stderr for `sbom registry://`, `docker://`, `scan`, `vulndb update`. No-op when stderr is piped, so JSON / CI flows stay byte-identical | done |
+| 7      | Interactive results browser (`scribe ui`) — libvaxis-based TUI with tab filtering, search, multi-select, bookmarks, clipboard yank, and export-diff against the previous run | done |
 
 Tests: 149 unit + integration tests (`zig build test`).
 
@@ -74,6 +77,13 @@ sudo zig build --prefix /usr/local install   # writes /usr/local/bin/scribe
 `./zig-out/bin/scribe` by default — no system-wide install happens unless
 you pass `--prefix`. All examples below assume `scribe` resolves on
 `PATH`; otherwise call the binary directly: `./zig-out/bin/scribe ...`.
+
+Dependencies are pinned by `build.zig.zon` and fetched automatically on
+first build. The only third-party dep is [libvaxis](https://github.com/rockorager/libvaxis)
+(plus its transitive deps `uucode` and `zigimg`), used by `scribe ui`.
+The library/CLI core has no third-party deps; vaxis is wired only into
+the executable's root module, so consumers that import `scribe` as a
+library never pull it in.
 
 Or import as a Zig dependency in another project:
 
@@ -110,6 +120,10 @@ scribe sbom 'registry://alpine:3.19@linux/amd64' > alpine.cdx.json
 # Walk a docker save tar
 docker save alpine:3.19 -o alpine.tar
 scribe sbom alpine.tar --plain
+
+# Interactive scan-results browser (TUI). Same scan pipeline as `scribe scan`,
+# but presented as a tabbed two-pane terminal app (q to quit).
+scribe ui /usr/bin/zsh --db osv.scvd
 ```
 
 ---
@@ -311,6 +325,69 @@ $ scribe fp match ./suspect-binary openssl-3.2.0.fp.json
 Useful for identifying statically linked libraries in stripped binaries
 where DT_NEEDED and embedded version strings are absent.
 
+### `scribe ui <source> [opts]`
+
+Interactive scan-results browser. Runs the same pipeline as `scribe scan`
+(SBOM + secret scan + optional vuln matching + optional IaC audit +
+optional fingerprint cross-ref) on `<source>` (binary path, `docker save`
+tar, `docker://`, or `registry://`), then opens a libvaxis-based TUI for
+triaging findings.
+
+```sh
+scribe ui /usr/bin/zsh                                         # binary
+scribe ui ./alpine.tar                                         # docker save tar
+scribe ui 'registry://alpine:3.19@linux/amd64' --db osv.scvd   # registry pull + vuln match
+scribe ui ./myapp --db osv.scvd --fp-db corpus.json --config Dockerfile
+```
+
+Flags (all optional):
+
+| Flag                | Effect                                                                |
+| ------------------- | --------------------------------------------------------------------- |
+| `--db <p>`          | Match SBOM components against an advisory `.scvd` / OSV-lite DB       |
+| `--fp-db <p>`       | Cross-ref with a fingerprint corpus (adds matches as components)      |
+| `--config <p>`      | Audit a Dockerfile / k8s manifest in addition to auto-discovered ones |
+| `--include-generic` | Include generic-shape secret matches (off by default)                 |
+| `--include-wide`    | Force wide-string scanning (auto-on for PE)                           |
+
+Layout: a tab bar across the top (one tab per category with live
+counts), a resizable two-pane split (left = filtered findings list,
+right = colored detail pane), and a status bar with key hints / search
+echo / transient action confirmations.
+
+Keys:
+
+| Key                  | Action                                                          |
+| -------------------- | --------------------------------------------------------------- |
+| `j` `k` `↑` `↓` `n` `p` | Navigate the list (mouse-wheel scroll also works)            |
+| `1` `2` `3` `4` `5`  | Filter to All / Components / Secrets / Vulns / Config           |
+| `Tab` / `Shift-Tab`  | Cycle filter forward / backward                                 |
+| `/`                  | Enter search mode (case-insensitive substring against titles)   |
+| `Enter`              | (in search) Confirm query and resume normal nav                 |
+| `Esc`                | (in search) Cancel and clear the query                          |
+| `Space`              | Toggle multi-select on the current row (auto-advances cursor)   |
+| `c`                  | Clear all multi-selections                                      |
+| `b`                  | Toggle bookmark — applies to all selected when set, else cursor |
+| `e`                  | Export bookmarks to `.scribe-bookmarks.md` (writes a diff block against the previous export when one exists) |
+| `y`                  | Yank current item's detail text to system clipboard (OSC 52)    |
+| `q` / `Esc` / `^C`   | Quit                                                            |
+
+Visual cues:
+
+- Severity-colored rows for vulnerabilities and config issues
+  (`critical` = bright red, `high` = red, `medium` = yellow,
+  `low` = cyan, `info` / `none` = gray).
+- Secret-row titles in bright yellow, component-row tags in cyan.
+- Selected rows highlighted with `▸ ` prefix and a dark-blue background.
+- Bookmarked rows prefixed with `★ ` (or `▸★ ` when also selected).
+- Section dividers and field labels in dim cyan / dim gray.
+
+The TUI requires `/dev/tty` access (it draws to the controlling
+terminal directly, not stdin/stdout), so piped invocations bail with
+`error: NoDevice` instead of garbling output. All other subcommands —
+including `scribe scan` — continue to emit plain or JSON output and are
+the right choice for CI.
+
 ---
 
 ### Security pipeline
@@ -432,6 +509,8 @@ Module surface:
 | `scribe.security.config`      | IaC audit (Dockerfile, Kubernetes, OCI image-config) |
 | `scribe.security.policy`      | JSON-driven gatekeeper over a populated `Sbom`       |
 | `scribe.yaml`                 | YAML 1.2 subset parser (multi-doc, anchors/aliases, merge keys, YAML 1.1 booleans, block + flow, Helm tolerated) — backs the Kubernetes audit |
+| `scribe.term`                 | TTY-aware ANSI styling (`Style.auto`, `severityCode`, `writeCount`)              |
+| `scribe.progress`             | Inline ANSI-spinner progress reporter (`Reporter.init`, `start`, `step`, `stepf`, `finish`, `fail`); no-op when stderr isn't a TTY |
 
 All public APIs allocate via the caller's allocator; no implicit globals.
 `*Info` and `Sbom` types own their string buffers and require explicit
@@ -546,7 +625,9 @@ tracked under 4b+ (blocked on a `std.debug.Dwarf` upstream bug). PE
    fingerprint.zig (Wyhash over .text)
 ```
 
-Cross-cutting modules: `mmap.zig` (RAII file mapping), `errors.zig` (unified error set), `strings.zig` and `entropy.zig` (shared SIMD/scalar utilities).
+Cross-cutting modules: `mmap.zig` (RAII file mapping), `errors.zig` (unified error set), `strings.zig` and `entropy.zig` (shared SIMD/scalar utilities), `term.zig` (TTY-aware ANSI styling), `progress.zig` (inline ANSI spinner threaded into long-running ops via `PullOptions.progress` / `pullSbomWithProgress` — TTY-gated, no-op on pipes).
+
+The `scribe ui` subcommand lives in `src/ui.zig` (executable-only, not part of the library module). It runs the same `runScan` collection pipeline and feeds findings into a libvaxis `vxfw.App` whose root widget owns a `FlexColumn { TabBar, SplitView { Border(ListView), Border(RichText) }, StatusBar }` tree and dispatches keys for nav, filter, search, multi-select, bookmark, export, and clipboard yank.
 
 ---
 
@@ -585,10 +666,13 @@ Cross-cutting modules: `mmap.zig` (RAII file mapping), `errors.zig` (unified err
 
 ## Roadmap
 
-Shipped: Phases 1 through 5e plus 3b-ext, 3c-ext, 4b, and 5e-ext
-(full forensics + security pipeline + fingerprint-robustness
-extensions + Mach-O `.dSYM` symbol enumeration + AST YAML for IaC +
-mmap-spooled `docker save`). Open work:
+Shipped: Phases 1 through 5e plus 3b-ext, 3c-ext, 4b, 5e-ext, 6
+(progress reporter), and 7 (`scribe ui` interactive browser) — full
+forensics + security pipeline + fingerprint-robustness extensions +
+Mach-O `.dSYM` symbol enumeration + AST YAML for IaC + mmap-spooled
+`docker save` + TTY-gated inline progress + libvaxis-backed TUI with
+filtering / search / multi-select / bookmarks / clipboard yank /
+export-diff. Open work:
 
 | Phase   | Item                                                                                  |
 | ------- | ------------------------------------------------------------------------------------- |
@@ -597,7 +681,7 @@ mmap-spooled `docker save`). Open work:
 | 4b+     | Mach-O `.dSYM` symbol enumeration ships and the CLI auto-resolves `<bin>.dSYM/...`. Source-line lookup currently bails on `error.InvalidDebugInfo` for DWARF 5 line programs whose file-name forms reference `__debug_line_str`; this is in `std.debug.Dwarf`'s line-program decoder, not in scribe — once the upstream path lands, `addr2line` will start working with no scribe-side change. |
 | 4c      | PE PDB parsing — scribe extracts the PDB GUID from the debug directory, but std.zig has no PDB parser. Multi-week port from the LLVM/MSF reverse-engineered docs. |
 | 5e-ext+ | YAML parser still doesn't handle complex keys (`?`-introduced) or the YAML 1.1 sexagesimal/binary integer notations. Neither shape appears in real Kubernetes / Helm manifests we've seen — kept on the list only so the gap is documented. |
-| 6       | Function-flow CFG construction, anti-tampering checks, yara-style rule integration — research direction; deeper static analysis as a foundation for `scribe-live` correlation. |
+| 8       | Function-flow CFG construction, anti-tampering checks, yara-style rule integration — research direction; deeper static analysis as a foundation for `scribe-live` correlation. |
 
 The `3b-ext+` / `3c-ext+` / `4b+` / `5e-ext+` rows are **partials** —
 the core capability is shipped (RIP-relative-aware normalized hashes,
@@ -606,4 +690,4 @@ walker covering anchors / aliases / merge keys / 1.1 booleans / flow /
 Helm) but the underlying architectural item flagged above is the
 natural follow-on. `4b+` is specifically blocked on a
 `std.debug.Dwarf` line-program bug, not on scribe-side work. `4c` and
-`6` are genuinely future work — not single-session deliverables.
+`8` are genuinely future work — not single-session deliverables.

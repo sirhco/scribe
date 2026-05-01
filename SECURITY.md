@@ -28,6 +28,7 @@ tar, registry pull, local-docker pull).
   - [`scribe scan`](#scribe-scan-umbrella)
   - [`scribe policy`](#scribe-policy)
   - [`scribe vulndb compile / update`](#scribe-vulndb)
+- [Interactive triage (`scribe ui`)](#interactive-triage)
 - [Populating the Advisory Database](#populating-the-advisory-database)
   - OSV.dev per-ecosystem zips (PyPI, npm, Go, …)
   - CISA KEV catalog
@@ -310,6 +311,51 @@ collapses to a single entry. First-occurrence-wins ordering.
 > [Populating the Advisory Database](#populating-the-advisory-database)
 > below for ready-made recipes against OSV.dev's per-ecosystem feeds and
 > the CISA KEV catalog.
+
+> **Inline progress.** `scribe vulndb update`, `scribe scan`,
+> `scribe sbom 'registry://...'` / `'docker://...'`, and `scribe ui` all
+> emit a TTY-gated ANSI spinner on stderr that walks the multi-stage
+> pipeline (auth → manifest → layer N/M → squash → analyze → match …).
+> When stderr is piped or redirected, the progress code path is a
+> compile-time-cheap no-op, so JSON / CI output remains byte-identical.
+
+---
+
+## Interactive triage
+
+For ad-hoc triage, `scribe ui <source>` opens a libvaxis-based two-pane
+TUI populated by the same scan pipeline. Same flags as `scribe scan`:
+
+```bash
+scribe ui ./myapp --db osv.scvd --fp-db corpus.json --config Dockerfile
+scribe ui 'registry://alpine:3.19@linux/amd64' --db osv.scvd
+```
+
+Layout: a tab bar at the top (counts per category), a resizable
+split-view (filtered findings list left, colored detail right), and a
+status bar with key hints / search echo / transient confirmations.
+
+| Key                  | Action                                                          |
+| -------------------- | --------------------------------------------------------------- |
+| `j` `k` `↑` `↓` `n` `p` | List nav (mouse wheel also scrolls)                          |
+| `1`–`5`              | Filter to All / Components / Secrets / Vulns / Config           |
+| `Tab` / `Shift-Tab`  | Cycle filter                                                    |
+| `/`                  | Search (case-insensitive substring)                             |
+| `Space`              | Multi-select current row (auto-advances cursor)                 |
+| `c`                  | Clear all selections                                            |
+| `b`                  | Bookmark — operates on selected set when set, else cursor row   |
+| `e`                  | Export bookmarks to `.scribe-bookmarks.md` (writes a `+/−` diff against the previous export when one exists) |
+| `y`                  | Yank current detail to system clipboard (OSC 52)                |
+| `q` / `Esc` / `^C`   | Quit                                                            |
+
+Severity colors match the plain-text `scan` output: `critical` bright
+red, `high` red, `medium` yellow, `low` cyan, `none`/`info` gray.
+Bookmarked rows render with a `★` prefix; multi-selected rows with `▸`
+plus a dark-blue background highlight.
+
+The TUI requires `/dev/tty`, so it can't be piped. For CI use the
+plain-text or JSON outputs of `scan` / `policy` instead — `scribe ui` is
+specifically the engineer-on-laptop triage surface.
 
 ---
 

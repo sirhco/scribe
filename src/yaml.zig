@@ -365,8 +365,22 @@ const Parser = struct {
     fn storeAnchor(self: *Parser, name: []const u8, node: Node) Error!void {
         // Anchors store DEEP COPIES so that the original tree's lifetime
         // is decoupled from the alias resolution.
-        const cloned = try cloneNode(self.allocator, node);
+        var cloned = try cloneNode(self.allocator, node);
+        errdefer cloned.deinit(self.allocator);
+
+        // YAML allows redeclaring the same anchor name; the new value
+        // replaces the old. Drop the previous entry's key + node before
+        // installing the replacement, otherwise the old clone leaks (and
+        // a fresh `dupe` of `name` would too, since `put` keeps the
+        // existing slot's key on overwrite).
+        if (self.anchors.fetchRemove(name)) |prev| {
+            self.allocator.free(prev.key);
+            var pv = prev.value;
+            pv.deinit(self.allocator);
+        }
+
         const key = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(key);
         try self.anchors.put(key, cloned);
     }
 
@@ -1188,4 +1202,19 @@ test "getPath walks nested mappings" {
     defer s.deinit(testing.allocator);
     const containers = s.documents[0].root.getPath("spec.template.spec.containers").?;
     try testing.expectEqual(NodeKind.sequence, containers.kind);
+}
+
+test "anchor name reused across docs frees prior clone" {
+    const src =
+        \\---
+        \\base: &x
+        \\  a: 1
+        \\copy: *x
+        \\---
+        \\base: &x
+        \\  b: 2
+        \\copy: *x
+    ;
+    var s = try parse(testing.allocator, src);
+    defer s.deinit(testing.allocator);
 }
