@@ -114,7 +114,45 @@ fn analyzeElf(
         break;
     }
 
+    // Overlapping sections detection — section file ranges should be
+    // disjoint. Real-world ELFs from gcc / clang produce non-overlapping
+    // sections; overlap is a strong tampering / packer signal.
+    try detectElfOverlap(allocator, &items, info);
+
     return .{ .items = items.toOwnedSlice(allocator) catch return error.OutOfMemory };
+}
+
+fn detectElfOverlap(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(Anomaly),
+    info: elf_mod.ElfInfo,
+) !void {
+    var i: usize = 0;
+    while (i < info.sections.len) : (i += 1) {
+        const a = info.sections[i];
+        if (a.size == 0 or a.type == 0) continue; // SHT_NULL
+        const a_end = a.offset + a.size;
+        var j: usize = i + 1;
+        while (j < info.sections.len) : (j += 1) {
+            const b = info.sections[j];
+            if (b.size == 0 or b.type == 0) continue;
+            const b_end = b.offset + b.size;
+            // SHT_NOBITS (8) sections occupy no file bytes; skip.
+            if (a.type == 8 or b.type == 8) continue;
+            if (a.offset < b_end and b.offset < a_end) {
+                const detail = std.fmt.allocPrint(allocator, "{s} (0x{x}+0x{x}) overlaps {s} (0x{x}+0x{x})", .{
+                    a.name, a.offset, a.size, b.name, b.offset, b.size,
+                }) catch return error.OutOfMemory;
+                try items.append(allocator, .{
+                    .id = "OVERLAP_SECTIONS",
+                    .title = "Overlapping ELF sections",
+                    .severity = .high,
+                    .detail = detail,
+                });
+                return; // one finding per binary is enough
+            }
+        }
+    }
 }
 
 fn isCanonicalElfInterp(p: []const u8) bool {
@@ -248,6 +286,32 @@ fn analyzeMacho(
             .severity = .medium,
             .detail = detail,
         });
+    }
+
+    // Mach-O section overlap (file-offset basis). Same heuristic as ELF.
+    var i: usize = 0;
+    outer: while (i < info.sections.len) : (i += 1) {
+        const a = info.sections[i];
+        if (a.size == 0 or a.offset == 0) continue;
+        const a_end = @as(u64, a.offset) + a.size;
+        var j: usize = i + 1;
+        while (j < info.sections.len) : (j += 1) {
+            const b = info.sections[j];
+            if (b.size == 0 or b.offset == 0) continue;
+            const b_end = @as(u64, b.offset) + b.size;
+            if (@as(u64, a.offset) < b_end and @as(u64, b.offset) < a_end) {
+                const detail = std.fmt.allocPrint(allocator, "{s}/{s} (0x{x}+0x{x}) overlaps {s}/{s} (0x{x}+0x{x})", .{
+                    a.seg, a.name, a.offset, a.size, b.seg, b.name, b.offset, b.size,
+                }) catch return error.OutOfMemory;
+                try items.append(allocator, .{
+                    .id = "OVERLAP_SECTIONS",
+                    .title = "Overlapping Mach-O sections",
+                    .severity = .high,
+                    .detail = detail,
+                });
+                break :outer;
+            }
+        }
     }
 
     return .{ .items = items.toOwnedSlice(allocator) catch return error.OutOfMemory };

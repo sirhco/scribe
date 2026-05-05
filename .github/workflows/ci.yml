@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / zig ${{ matrix.zig }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        zig: ['0.16.0']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ matrix.zig }}
+
+      - name: zig fmt --check
+        run: zig fmt --check src/ build.zig
+
+      - name: zig build
+        run: zig build
+
+      - name: zig build test
+        run: zig build test
+
+      - name: Smoke — info / harden / yara on fixtures
+        shell: bash
+        run: |
+          ./zig-out/bin/scribe --version
+          ./zig-out/bin/scribe info src/testdata/hello_x86_64
+          ./zig-out/bin/scribe harden src/testdata/hello_x86_64
+          ./zig-out/bin/scribe harden src/testdata/hello_pe_x86_64
+          ./zig-out/bin/scribe info src/testdata/hello_x86_64 --json | head -c 200
+          ./zig-out/bin/scribe yara src/testdata/hello_x86_64 --rules examples/yara/secrets_anchor.yar || true

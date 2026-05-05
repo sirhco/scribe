@@ -273,6 +273,8 @@ fn analyzeMacho(
 
     // Walk load commands for code-sig / encryption / restricted segment / rpath.
     var has_code_sig = false;
+    var code_sig_off: u32 = 0;
+    var code_sig_size: u32 = 0;
     var encrypted = false;
     var has_rpath = false;
     var has_restrict = false;
@@ -290,7 +292,14 @@ fn analyzeMacho(
             if (cmdsize < @sizeOf(std.macho.load_command)) break;
             if (off + cmdsize > lc_end) break;
             switch (lc.cmd) {
-                .CODE_SIGNATURE => has_code_sig = true,
+                .CODE_SIGNATURE => {
+                    has_code_sig = true;
+                    if (cmdsize >= @sizeOf(std.macho.linkedit_data_command)) {
+                        const led: *align(1) const std.macho.linkedit_data_command = @ptrCast(bytes[off..].ptr);
+                        code_sig_off = led.dataoff;
+                        code_sig_size = led.datasize;
+                    }
+                },
                 .RPATH => has_rpath = true,
                 .ENCRYPTION_INFO => {
                     if (cmdsize >= @sizeOf(encryption_info_command_32)) {
@@ -323,6 +332,17 @@ fn analyzeMacho(
     }
 
     try checks.append(allocator, .{ .id = "CODE_SIG", .name = "Code signature", .status = if (has_code_sig) Status.enabled else .disabled });
+    if (has_code_sig and code_sig_size > 0 and code_sig_off + code_sig_size <= bytes.len) {
+        const sig_blob = bytes[code_sig_off..][0..code_sig_size];
+        if (parseCodeSig(allocator, sig_blob)) |cs_info| {
+            if (cs_info.identifier) |id| {
+                try checks.append(allocator, .{ .id = "CS_IDENT", .name = "Code-sig identifier", .status = .enabled, .detail = id });
+            }
+            if (cs_info.team_id) |team| {
+                try checks.append(allocator, .{ .id = "CS_TEAM", .name = "Code-sig team-id", .status = .enabled, .detail = team });
+            }
+        } else |_| {}
+    }
     try checks.append(allocator, .{ .id = "ENCRYPTED", .name = "FairPlay encrypted", .status = if (encrypted) Status.enabled else .disabled });
     if (has_restrict)
         try checks.append(allocator, .{ .id = "RESTRICT", .name = "__RESTRICT segment", .status = .enabled });
@@ -368,6 +388,65 @@ fn readSizeofcmds(info: macho_mod.MachoInfo, bytes: []const u8) u32 {
     }
     const h: *align(1) const std.macho.mach_header = @ptrCast(bytes.ptr);
     return h.sizeofcmds;
+}
+
+// ----------------------------------------------------------------------------
+// Mach-O Code Signature partial parser. Reads the EmbeddedSignature
+// SuperBlob, walks blob index entries, finds the CodeDirectory (type 0),
+// and extracts identifier + team-id strings (offset fields, NUL-term).
+// Out of scope: CMS chain validation, CodeDirectory hash verification,
+// entitlement plist parsing.
+// ----------------------------------------------------------------------------
+
+const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade0cc0;
+const CSMAGIC_CODEDIRECTORY: u32 = 0xfade0c02;
+
+const CodeSigInfo = struct {
+    identifier: ?[]u8,
+    team_id: ?[]u8,
+};
+
+fn parseCodeSig(allocator: std.mem.Allocator, blob: []const u8) !CodeSigInfo {
+    if (blob.len < 12) return error.UnsupportedFormat;
+    const magic = std.mem.readInt(u32, blob[0..4], .big);
+    if (magic != CSMAGIC_EMBEDDED_SIGNATURE) return error.UnsupportedFormat;
+    const count = std.mem.readInt(u32, blob[8..12], .big);
+    if (count == 0 or count > 64) return error.UnsupportedFormat;
+
+    var ident: ?[]u8 = null;
+    var team: ?[]u8 = null;
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const idx_off = 12 + i * 8;
+        if (idx_off + 8 > blob.len) break;
+        const blob_off = std.mem.readInt(u32, blob[idx_off + 4 ..][0..4], .big);
+        if (blob_off + 8 > blob.len) continue;
+        const sub_magic = std.mem.readInt(u32, blob[blob_off..][0..4], .big);
+        if (sub_magic != CSMAGIC_CODEDIRECTORY) continue;
+
+        const sub_len = std.mem.readInt(u32, blob[blob_off + 4 ..][0..4], .big);
+        if (blob_off + sub_len > blob.len) continue;
+        if (sub_len < 24) continue;
+
+        const cd = blob[blob_off..][0..sub_len];
+        const version = std.mem.readInt(u32, cd[8..12], .big);
+        const ident_offset = std.mem.readInt(u32, cd[20..24], .big);
+        if (ident_offset > 0 and ident_offset < cd.len) {
+            const id = std.mem.sliceTo(cd[ident_offset..], 0);
+            if (id.len > 0) ident = try allocator.dupe(u8, id);
+        }
+        // teamOffset present only when version >= 0x20200.
+        if (version >= 0x20200 and cd.len >= 52) {
+            const team_offset = std.mem.readInt(u32, cd[48..52], .big);
+            if (team_offset > 0 and team_offset < cd.len) {
+                const t = std.mem.sliceTo(cd[team_offset..], 0);
+                if (t.len > 0) team = try allocator.dupe(u8, t);
+            }
+        }
+        break;
+    }
+    return .{ .identifier = ident, .team_id = team };
 }
 
 // ----------------------------------------------------------------------------

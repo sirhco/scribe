@@ -399,6 +399,9 @@ const Root = struct {
                 if (key.matches('6', .{})) return self.setFilter(ctx, .hardening);
                 if (key.matches(vaxis.Key.tab, .{})) return self.cycleFilter(ctx, 1);
                 if (key.matches(vaxis.Key.tab, .{ .shift = true })) return self.cycleFilter(ctx, -1);
+                // Page-style movement — capital J / K jumps 10 rows at once.
+                if (key.matches('J', .{}) or key.matches(vaxis.Key.page_down, .{})) return self.pageMove(ctx, 10);
+                if (key.matches('K', .{}) or key.matches(vaxis.Key.page_up, .{})) return self.pageMove(ctx, -10);
                 try self.list.handleEvent(ctx, event);
             },
             .init => {
@@ -630,9 +633,23 @@ const Root = struct {
 
     fn cycleFilter(self: *Root, ctx: *vxfw.EventContext, dir: i8) void {
         const cur: i8 = @intCast(@intFromEnum(self.filter));
-        const next: i8 = @mod(cur + dir, 5);
+        const next: i8 = @mod(cur + dir, 6);
         const f: Filter = @enumFromInt(@as(u8, @intCast(next)));
         self.setFilter(ctx, f);
+    }
+
+    fn pageMove(self: *Root, ctx: *vxfw.EventContext, delta: i32) void {
+        const total_u: u32 = self.list.item_count orelse 0;
+        const total: i32 = @intCast(total_u);
+        if (total == 0) {
+            ctx.consume_event = true;
+            return;
+        }
+        var new_cursor: i32 = @as(i32, @intCast(self.list.cursor)) + delta;
+        if (new_cursor < 0) new_cursor = 0;
+        if (new_cursor >= total) new_cursor = total - 1;
+        self.list.cursor = @intCast(new_cursor);
+        ctx.consumeAndRedraw();
     }
 
     fn setFilter(self: *Root, ctx: *vxfw.EventContext, f: Filter) void {

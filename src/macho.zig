@@ -282,7 +282,7 @@ fn parseThin32(
     var dylibs: std.ArrayList(Dylib) = .empty;
     errdefer dylibs.deinit(allocator);
 
-    const entry: u64 = 0;
+    var entry: u64 = 0;
 
     var off: usize = lc_start;
     var i: u32 = 0;
@@ -325,8 +325,25 @@ fn parseThin32(
                     return error.OutOfMemory;
             },
             // 32-bit Mach-O has no LC_MAIN; entry comes from LC_UNIXTHREAD's
-            // thread_state. Layout varies per arch, so leave entry=0 unless
-            // we add per-arch decoders later.
+            // thread_state. Layout: u32 flavor, u32 count, count*u32 state.
+            // x86 i386_THREAD_STATE (flavor=1): eip is at state[10].
+            // ARM  ARM_THREAD_STATE (flavor=1): pc is at state[15].
+            .UNIXTHREAD => {
+                const tc_size = @sizeOf(std.macho.load_command);
+                if (lc_bytes.len < tc_size + 8) {} else {
+                    const flavor = std.mem.readInt(u32, lc_bytes[tc_size..][0..4], .little);
+                    const count = std.mem.readInt(u32, lc_bytes[tc_size + 4 ..][0..4], .little);
+                    const state_off = tc_size + 8;
+                    const cputype = header.cputype;
+                    if (cputype == 7 and flavor == 1 and count >= 16 and state_off + 4 * 16 <= lc_bytes.len) {
+                        // x86: eip at state[10]
+                        entry = std.mem.readInt(u32, lc_bytes[state_off + 10 * 4 ..][0..4], .little);
+                    } else if (cputype == 12 and flavor == 1 and count >= 17 and state_off + 4 * 17 <= lc_bytes.len) {
+                        // ARM: pc at state[15]
+                        entry = std.mem.readInt(u32, lc_bytes[state_off + 15 * 4 ..][0..4], .little);
+                    }
+                }
+            },
             else => {},
         }
 

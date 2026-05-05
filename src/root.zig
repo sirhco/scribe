@@ -8,6 +8,8 @@ const std = @import("std");
 pub const elf = @import("elf.zig");
 pub const macho = @import("macho.zig");
 pub const pe = @import("pe.zig");
+pub const wasm = @import("wasm.zig");
+pub const ar = @import("ar.zig");
 pub const format = @import("format.zig");
 pub const errors = @import("errors.zig");
 pub const mmap = @import("mmap.zig");
@@ -39,6 +41,33 @@ pub const parseMacho = macho.parse;
 pub const parsePe = pe.parse;
 pub const detectFormat = format.detect;
 pub const parseFormat = format.parse;
+
+/// Convenience: mmap a path and parse its format in one call. The returned
+/// `Parsed` owns both the mapping and the info; deinit frees both.
+pub const Parsed = struct {
+    mapping: mmap.Mapping,
+    info: format.Info,
+
+    pub fn bytes(self: *const Parsed) []const u8 {
+        return self.mapping.bytes();
+    }
+
+    pub fn deinit(self: *Parsed, allocator: std.mem.Allocator) void {
+        self.info.deinit(allocator);
+        self.mapping.deinit();
+    }
+};
+
+pub fn parseFromFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !Parsed {
+    var mapping = try mmap.open(io, path);
+    errdefer mapping.deinit();
+    const info = try format.parse(allocator, mapping.bytes());
+    return .{ .mapping = mapping, .info = info };
+}
 pub const collectDeps = deps.collect;
 pub const shannon = entropy.shannon;
 pub const scanStrings = strings.scan;
@@ -63,6 +92,9 @@ pub const scanYara = security.yara.scan;
 pub const AnomalyReport = security.anomalies.Report;
 pub const analyzeAnomalies = security.anomalies.analyze;
 
+// Smoke-fuzz harness — exercises parsers with malformed input to catch
+// panics-on-bad-bytes regressions.
 test {
+    _ = @import("fuzz.zig");
     std.testing.refAllDecls(@This());
 }

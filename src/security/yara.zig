@@ -425,6 +425,7 @@ const Parser = struct {
         _ = try self.expect(.kw_condition);
         _ = try self.expect(.colon);
         const cond = try self.parseExpr(strings.items);
+        errdefer freeCond(self.allocator, cond);
 
         _ = try self.expect(.rbrace);
 
@@ -448,9 +449,11 @@ const Parser = struct {
 
     fn parseOr(self: *Parser, strs: []StringDef) ScribeError!*Cond {
         var lhs = try self.parseAnd(strs);
+        errdefer freeCond(self.allocator, lhs);
         while (self.cur.kind == .kw_or) {
             try self.advance();
             const rhs = try self.parseAnd(strs);
+            errdefer freeCond(self.allocator, rhs);
             const node = self.allocator.create(Cond) catch return error.OutOfMemory;
             node.* = .{ .or_op = .{ .lhs = lhs, .rhs = rhs } };
             lhs = node;
@@ -460,9 +463,11 @@ const Parser = struct {
 
     fn parseAnd(self: *Parser, strs: []StringDef) ScribeError!*Cond {
         var lhs = try self.parseUnary(strs);
+        errdefer freeCond(self.allocator, lhs);
         while (self.cur.kind == .kw_and) {
             try self.advance();
             const rhs = try self.parseUnary(strs);
+            errdefer freeCond(self.allocator, rhs);
             const node = self.allocator.create(Cond) catch return error.OutOfMemory;
             node.* = .{ .and_op = .{ .lhs = lhs, .rhs = rhs } };
             lhs = node;
@@ -474,6 +479,7 @@ const Parser = struct {
         if (self.cur.kind == .kw_not) {
             try self.advance();
             const inner = try self.parseUnary(strs);
+            errdefer freeCond(self.allocator, inner);
             const node = self.allocator.create(Cond) catch return error.OutOfMemory;
             node.* = .{ .not_op = inner };
             return node;
@@ -486,6 +492,7 @@ const Parser = struct {
             .lparen => {
                 try self.advance();
                 const inner = try self.parseExpr(strs);
+                errdefer freeCond(self.allocator, inner);
                 _ = try self.expect(.rparen);
                 return inner;
             },

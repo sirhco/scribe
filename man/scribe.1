@@ -1,0 +1,152 @@
+.TH SCRIBE 1 "2026-05-04" "scribe 0.2.0" "User Commands"
+.SH NAME
+scribe \- binary forensics, SBOM, security pipeline
+.SH SYNOPSIS
+.B scribe
+.RI [ global-options ]
+.I subcommand
+.RI [ args... ]
+.SH DESCRIPTION
+.B scribe
+is a Zig\-native binary forensics library and CLI. It parses ELF, Mach\-O, PE,
+WebAssembly, and AR archive formats with zero\-copy techniques; extracts
+dynamic dependencies, exported and imported symbols, and DWARF function
+tables; computes per\-section Shannon entropy and SHA\-256 hashes;
+fingerprints functions for static\-library identification; and produces
+CycloneDX 1.5 Software Bills of Materials for binaries and full container
+images (including direct OCI registry pulls).
+.PP
+The security pipeline layers in SIMD secret scanning, CVE/advisory
+matching, IaC misconfiguration audit, exploit\-mitigation analysis, YARA\-subset
+rule matching, and anti\-tampering anomaly detection. Findings flow into a
+single CycloneDX SBOM or, for CI, into SARIF 2.1.0 or GitHub Annotations.
+.SH GLOBAL OPTIONS
+.TP
+.B \-\-version, \-V, version
+Print scribe version and exit.
+.TP
+.B \-\-help, \-h, help
+Print usage and exit.
+.TP
+.B \-\-quiet, \-q
+Suppress the inline progress reporter.
+.TP
+.B \-\-no\-color
+Force\-disable ANSI styling regardless of TTY detection.
+.SH SUBCOMMANDS
+.SS Forensics
+.TP
+.B info \fIpath\fR \fR[\-\-json] \fR[\-\-all\-slices] \fR[\-\-hashes]
+Format, arch, entry point, sections, hardening posture. \-\-all\-slices dumps every slice of a FAT/Universal Mach\-O. \-\-hashes adds per\-section SHA\-256 (first 8 bytes hex).
+.TP
+.B harden \fIpath\fR \fR[\-\-json]
+Cross\-format exploit\-mitigation report (PIE, NX, RELRO, CFG, GS, code\-sig, ...).
+.TP
+.B yara \fIpath\fR \-\-rules \fIp\fR \fR[\-\-json]
+Match a YARA\-subset rule file against the target.
+.TP
+.B hex \fIpath\fR \fR[\-\-offset 0x...] \fR[\-\-length N] \fR[\-\-section name]
+Hex + ASCII dump.
+.TP
+.B exports \fIpath\fR \fR[\-\-json]
+Dynamically\-exported symbols.
+.TP
+.B imports \fIpath\fR \fR[\-\-json]
+Dynamically\-imported symbols.
+.TP
+.B diff \fIa\fR \fIb\fR \fR[\-\-json]
+Structural diff: format, arch, sections, hardening posture.
+.TP
+.B deps \fIpath\fR \fR[\-\-json]
+Dynamic library dependencies.
+.TP
+.B strings \fIpath\fR \fR[min] \fR[\-\-json]
+SIMD\-accelerated printable\-ASCII run extractor.
+.TP
+.B entropy \fIpath\fR \fR[\-\-json]
+Shannon entropy per section.
+.TP
+.B wasm \fIpath\fR \fR[\-\-json]
+List WebAssembly module sections.
+.TP
+.B ar list \fIpath\fR \fR[\-\-json]
+List members of a static archive (.a / .lib).
+.TP
+.B sbom \fIpath\fR \fR[\-\-plain]
+CycloneDX 1.5 SBOM. Source: file path, docker save tar, docker:// URI, or registry:// URI.
+.TP
+.B symbols \fIpath\fR
+DWARF function table (ELF or Mach\-O dSYM).
+.TP
+.B addr2line \fIpath\fR \fIhex-addr\fR
+Resolve runtime address to source file:line:column.
+.TP
+.B fp generate|match
+Function\-byte fingerprint database (Wyhash, DWARF\-keyed). \fBgenerate\fR writes JSON corpus; \fBmatch\fR runs corpus against a target.
+.SS Security pipeline
+.TP
+.B secrets \fIpath\fR \fR[\-\-json] \fR[\-\-include\-generic] \fR[\-\-include\-wide] \fR[\-\-min\-entropy N]
+SIMD anchored + UTF\-16LE secret scan with optional entropy filter.
+.TP
+.B vulns \fIpath\fR \-\-db \fIp\fR \fR[\-\-json]
+CVE / advisory matcher (binary, container tar, or OCI registry source).
+.TP
+.B config \fIpath\fR \fR[\-\-type dockerfile|kubernetes] \fR[\-\-json]
+IaC misconfiguration audit.
+.TP
+.B scan \fIpath\fR \fR[\-\-db p] \fR[\-\-config p] \fR[\-\-fp\-db p] \fR[\-\-yara p] \fR[\-\-include\-generic] \fR[\-\-include\-wide] \fR[\-\-plain] \fR[\-\-sarif] \fR[\-\-github\-annotations]
+Full pipeline: SBOM + secrets + vulns + IaC + fingerprints + hardening + anomalies + YARA. Output is CycloneDX 1.5 by default; \-\-plain for human\-readable; \-\-sarif for SARIF 2.1.0; \-\-github\-annotations for GitHub Actions workflow commands.
+.TP
+.B policy \fIpath\fR \-\-policy \fIp\fR \fR[\-\-db d] \fR[\-\-config c] \fR[\-\-json]
+Evaluate scan results against a JSON policy. Exits 1 on violation.
+.TP
+.B vulndb compile|merge|update
+Advisory DB management (mmap\-friendly binary .scvd format).
+.SS Interactive
+.TP
+.B ui \fIpath\fR \fR[\-\-db p] \fR[\-\-config p] \fR[\-\-fp\-db p] \fR[\-\-include\-generic] \fR[\-\-include\-wide]
+Open libvaxis TUI over the same pipeline as \fBscan\fR. Tabs for All / Components / Secrets / Vulns / Config / Hardening, search, multi\-select, bookmarks, clipboard yank, export\-diff. Press ? for in\-app key map.
+.SS Misc
+.TP
+.B completion bash|zsh|fish
+Emit shell completion script.
+.SH SOURCES
+.TP
+.B File path
+Single binary or docker save tarball.
+.TP
+.B docker://image[:tag]
+Local docker daemon image (spawns docker save under the hood).
+.TP
+.B registry://[host/]name:tag[@os/arch]
+Direct OCI V2 pull over HTTPS, no daemon required.
+.SH OUTPUT
+Structured output goes to stdout; errors and progress to stderr.
+Long\-running operations emit an inline ANSI spinner on stderr when
+attached to a TTY; piped/scripted invocations stay byte\-identical.
+.SH FILES
+.TP
+.I .scribe-bookmarks.md
+Written by the TUI when you press \fBe\fR; subsequent exports diff against this file.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+When set non\-empty, disables ANSI styling (same effect as \-\-no\-color).
+.SH EXIT STATUS
+.TP
+.B 0
+success
+.TP
+.B 1
+parse error, missing argument, or scan/policy violation
+.SH SEE ALSO
+.BR file (1),
+.BR otool (1),
+.BR readelf (1),
+.BR dumpbin (1),
+.BR yara (1),
+.BR codesign (1)
+.SH BUGS
+Report at the project's GitHub issue tracker.
+.SH AUTHOR
+scribe contributors.
