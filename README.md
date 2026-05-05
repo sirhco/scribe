@@ -54,8 +54,13 @@ Scribe is a high-performance, cross-platform binary forensics library and CLI wr
 | 3c-ext | `docker save` stdout spooled straight to a tempfile (no in-memory cap); outer-tar walk is zero-copy via mmap so resident memory tracks the working set, not the image size | done |
 | 6      | Inline progress reporter — TTY-gated ANSI spinner + status label on stderr for `sbom registry://`, `docker://`, `scan`, `vulndb update`. No-op when stderr is piped, so JSON / CI flows stay byte-identical | done |
 | 7      | Interactive results browser (`scribe ui`) — libvaxis-based TUI with tab filtering, search, multi-select, bookmarks, clipboard yank, and export-diff against the previous run | done |
+| 8a     | Cross-format hardening (`scribe harden`, folded into `scribe info` and `scribe scan`) — PIE / NX / RELRO / canary / FORTIFY / RPATH on ELF; PIE / NX_HEAP / CODE_SIG / ENCRYPTED on Mach-O; ASLR / DEP / CFG / GS / SafeSEH / Authenticode on PE | done |
+| 8b     | FAT/Universal Mach-O auto-resolve (host-arch slice picker), 32-bit Mach-O parity, `error.NotElf` → `UnsupportedFormat` | done |
+| 8c     | YARA-subset rule engine (`scribe yara`, `scribe scan --yara`) — literal + hex strings, `any/all/N of them`, `and/or/not` | done |
+| 8d     | Anti-tampering anomalies (auto-run in `scan`) — entry-outside-text, non-canonical interpreter / dylinker, process-injection symbol cluster | done |
+| 8+     | Full disassembler-driven CFG, PE PDB parser, capability/syscall scan, code-signature CMS + entitlements parser | open |
 
-Tests: 149 unit + integration tests (`zig build test`).
+Tests: 156 unit + integration tests (`zig build test`).
 
 ---
 

@@ -18,8 +18,8 @@ const usage =
     \\  scribe secrets <path> [opts]   SIMD secret scan ([--json] [--include-generic] [--include-wide] [--min-entropy N])
     \\  scribe vulns <path> --db <p>   match SBOM components against advisory DB ([--json])
     \\  scribe config <path> [opts]    audit Dockerfile / k8s manifest ([--type dockerfile|kubernetes] [--json])
-    \\  scribe scan <path> [opts]      full pipeline: SBOM + secrets + vulns + IaC + fingerprint
-    \\                                 ([--db p] [--config p] [--fp-db p] [--include-generic] [--include-wide] [--plain])
+    \\  scribe scan <path> [opts]      full pipeline: SBOM + secrets + vulns + IaC + fingerprint + hardening + anomalies
+    \\                                 ([--db p] [--config p] [--fp-db p] [--yara p] [--include-generic] [--include-wide] [--plain])
     \\  scribe policy <path> --policy <p>  evaluate scan results against policy ([--db d] [--config c] [--json]); exits 1 on fail
     \\  scribe vulndb compile <in.json|-> <out.scvd>    compile JSON advisory DB to mmap-friendly binary (.scvd)
     \\  scribe vulndb merge <out.scvd> <in1> [in2...]   merge multiple .scvd or JSON advisory DBs into one

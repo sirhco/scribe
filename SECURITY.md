@@ -9,6 +9,9 @@ Scribe's binary forensics primitives. Five integrated modules:
 | `security.vulnerability` | CVE / advisory matcher (binaries, container tars, OCI registry, local docker). Alias-aware dedup. JSON (OSV-lite, OSV native) + binary mmap'd `.scvd` DBs |
 | `security.config`      | IaC misconfiguration audit for Dockerfiles, Kubernetes manifests, OCI image-config blobs   |
 | `security.policy`      | Gatekeeper that evaluates SBOMs against JSON-defined fail conditions                       |
+| `security.hardening`   | Cross-format exploit-mitigation analyzer (PIE / NX / RELRO / CFG / GS / Authenticode / code-sig …) |
+| `security.anomalies`   | Anti-tampering structural checks (entry-outside-text, non-canonical interpreter, injection symbols) |
+| `security.yara`        | YARA-subset rule engine (literal + hex strings, `any/all/N of them`, `and/or/not`)         |
 | `fingerprint` (cross-ref) | Bridges Wyhash function-byte fingerprints into the vuln matcher for stripped binaries  |
 
 Output: every signal flows into a single CycloneDX 1.5 SBOM
@@ -43,6 +46,9 @@ tar, registry pull, local-docker pull).
   - [Dockerfile (`DKR###`)](#dockerfile-rules-dkr)
   - [Kubernetes (`K8S###`)](#kubernetes-rules-k8s)
   - [OCI image-config (`OCI###`)](#oci-image-config-rules-oci)
+  - [Binary hardening (`BIN-{ELF,MAC,PE}-*`)](#binary-hardening-rules-bin)
+  - [Anti-tampering anomalies (`BIN-ANOM-*`)](#anti-tampering-rules-bin-anom)
+  - [YARA matches (`YARA-<rule>`)](#yara-rules-yara)
 - [Secret Pattern Catalog](#secret-pattern-catalog)
 - [Memory & Allocator Philosophy](#memory--allocator-philosophy)
 - [Performance Notes](#performance-notes)
@@ -776,6 +782,61 @@ OCI rules see the **effective runtime state** of the image (post
 multi-stage build, post FROM inheritance) — they catch problems
 Dockerfile-text rules can miss when the offending state comes from a
 base image.
+
+### Binary hardening rules (`BIN-`)
+
+Surfaced by `scribe harden`, folded into `scribe scan` and `scribe info`
+automatically. Status semantics: `enabled` (protection on), `disabled`
+(off — surfaced as a finding), `partial` (e.g. RELRO without
+`BIND_NOW`), `unknown` (heuristic could not decide), `na`. Only the
+**non-enabled** statuses become `config_issues` in `scan` output.
+
+Rule IDs are `BIN-<format>-<check>`. `<format>` is `ELF`, `MAC`, or `PE`.
+
+| ID                    | Format | Severity (when off) | Title                                                |
+| --------------------- | ------ | ------------------- | ---------------------------------------------------- |
+| BIN-ELF-PIE           | ELF    | medium              | Position-Independent Executable                      |
+| BIN-ELF-NX            | ELF    | medium              | Non-executable stack (`PT_GNU_STACK !X`)             |
+| BIN-ELF-RELRO         | ELF    | medium / low (partial) | Read-only relocations (full = +`DT_BIND_NOW`)     |
+| BIN-ELF-CANARY        | ELF    | low                 | Stack canary (`__stack_chk_fail` linked)             |
+| BIN-ELF-FORTIFY       | ELF    | low                 | `_FORTIFY_SOURCE` libc wrappers                      |
+| BIN-ELF-RPATH         | ELF    | info                | Embedded `DT_RPATH` / `DT_RUNPATH`                   |
+| BIN-ELF-STRIPPED      | ELF    | info                | `.symtab` removed                                    |
+| BIN-MAC-PIE           | Mach-O | medium              | `MH_PIE` flag set                                    |
+| BIN-MAC-NX_HEAP       | Mach-O | low                 | `MH_NO_HEAP_EXECUTION` flag set                      |
+| BIN-MAC-STACK_EXEC    | Mach-O | info                | `MH_ALLOW_STACK_EXECUTION` (risky when on)           |
+| BIN-MAC-CODE_SIG      | Mach-O | medium              | `LC_CODE_SIGNATURE` blob present                     |
+| BIN-MAC-ENCRYPTED     | Mach-O | info                | `LC_ENCRYPTION_INFO[_64]` `cryptid != 0`             |
+| BIN-MAC-RPATH         | Mach-O | info                | `LC_RPATH` present                                   |
+| BIN-MAC-CANARY        | Mach-O | low                 | Stack canary (`_stack_chk_fail` symbol)              |
+| BIN-PE-ASLR           | PE     | medium              | `IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE`              |
+| BIN-PE-HIGH_ENTROPY_VA| PE     | low                 | 64-bit high-entropy ASLR                             |
+| BIN-PE-DEP            | PE     | medium              | `NX_COMPAT` flag                                     |
+| BIN-PE-CFG            | PE     | low                 | Control Flow Guard                                   |
+| BIN-PE-GS             | PE     | low                 | Stack-cookie (`SecurityCookie` non-zero)             |
+| BIN-PE-SAFESEH        | PE     | low                 | Safe SEH (32-bit only)                               |
+| BIN-PE-AUTHENTICODE   | PE     | medium              | Certificate-table data directory populated           |
+
+### Anti-tampering rules (`BIN-ANOM-`)
+
+Run automatically on every binary target inside `scribe scan`.
+Findings are structural anomalies, not definitive failures — they
+warrant manual triage.
+
+| ID                       | Format    | Severity | Title                                             |
+| ------------------------ | --------- | -------- | ------------------------------------------------- |
+| BIN-ANOM-ENTRY_OUT_OF_TEXT  | all     | medium   | Entry point outside any executable section       |
+| BIN-ANOM-INTERP_NONCANONICAL | ELF    | low      | Non-canonical ELF interpreter (`PT_INTERP`)      |
+| BIN-ANOM-DYLINKER_NONCANONICAL | Mach-O | low   | Dynamic linker not `/usr/lib/dyld`               |
+| BIN-ANOM-INJECTION_SYMS  | Mach-O    | medium   | ≥2 process-injection symbols imported            |
+
+### YARA rules (`YARA-`)
+
+Each rule that matches the target produces a `YARA-<rule-name>` issue
+at severity `medium`. Hits are listed in the `snippet` field as
+`first hit @ 0x<offset>`. Use `scribe yara <path> --rules <p>` for the
+full per-string offset breakdown; `scribe scan --yara <p>` is the
+batched form that joins matches with the rest of the SBOM.
 
 ---
 

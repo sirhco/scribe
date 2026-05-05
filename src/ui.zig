@@ -70,6 +70,7 @@ const Filter = enum(u8) {
     secrets = 2,
     vulnerabilities = 3,
     config = 4,
+    hardening = 5,
 
     fn label(self: Filter) []const u8 {
         return switch (self) {
@@ -78,6 +79,7 @@ const Filter = enum(u8) {
             .secrets => " Secrets ",
             .vulnerabilities => " Vulnerabilities ",
             .config => " Config ",
+            .hardening => " Hardening ",
         };
     }
 
@@ -88,6 +90,7 @@ const Filter = enum(u8) {
             .secrets => cat == .summary or cat == .secret or cat == .heading_secrets,
             .vulnerabilities => cat == .summary or cat == .vulnerability or cat == .heading_vulnerabilities,
             .config => cat == .summary or cat == .config or cat == .heading_config,
+            .hardening => cat == .summary or cat == .hardening or cat == .heading_hardening,
         };
     }
 };
@@ -102,6 +105,8 @@ const Category = enum {
     vulnerability,
     heading_config,
     config,
+    heading_hardening,
+    hardening,
 };
 
 // ---- item ------------------------------------------------------------------
@@ -155,7 +160,7 @@ const TabBar = struct {
         const surface = try vxfw.Surface.init(ctx.arena, self.widget(), size);
         @memset(surface.buffer, .{ .style = .{} });
 
-        const labels = [_]Filter{ .all, .components, .secrets, .vulnerabilities, .config };
+        const labels = [_]Filter{ .all, .components, .secrets, .vulnerabilities, .config, .hardening };
         var col: u16 = 0;
         for (labels, 0..) |f, i| {
             const is_active = self.state.filter == f;
@@ -165,6 +170,7 @@ const TabBar = struct {
                 2 => "3",
                 3 => "4",
                 4 => "5",
+                5 => "6",
                 else => "?",
             };
             // counter
@@ -327,7 +333,7 @@ const Root = struct {
     item_index_map: []usize,
 
     filter: Filter = .all,
-    counts: [5]usize,
+    counts: [6]usize,
 
     mode: Mode = .normal,
     query_buf: [128]u8 = undefined,
@@ -378,6 +384,7 @@ const Root = struct {
                 if (key.matches('3', .{})) return self.setFilter(ctx, .secrets);
                 if (key.matches('4', .{})) return self.setFilter(ctx, .vulnerabilities);
                 if (key.matches('5', .{})) return self.setFilter(ctx, .config);
+                if (key.matches('6', .{})) return self.setFilter(ctx, .hardening);
                 if (key.matches(vaxis.Key.tab, .{})) return self.cycleFilter(ctx, 1);
                 if (key.matches(vaxis.Key.tab, .{ .shift = true })) return self.cycleFilter(ctx, -1);
                 try self.list.handleEvent(ctx, event);
@@ -493,6 +500,7 @@ const Root = struct {
             .heading_secrets,
             .heading_vulnerabilities,
             .heading_config,
+            .heading_hardening,
             => {
                 ctx.consume_event = true;
                 return;
@@ -799,13 +807,14 @@ pub fn run(
         .min_width = 24,
     };
 
-    var counts: [5]usize = .{ 0, 0, 0, 0, 0 };
+    var counts: [6]usize = .{ 0, 0, 0, 0, 0, 0 };
     counts[0] = items.len;
     for (items) |it| switch (it.category) {
         .component => counts[1] += 1,
         .secret => counts[2] += 1,
         .vulnerability => counts[3] += 1,
         .config => counts[4] += 1,
+        .hardening => counts[5] += 1,
         else => {},
     };
 
@@ -1230,60 +1239,51 @@ fn buildItems(arena: Allocator, bom: *const scribe.sbom.Sbom, source: []const u8
     }
 
     if (bom.config_issues.len > 0) {
-        try list.append(arena, .{
-            .title_plain = try std.fmt.allocPrint(arena, "── config issues ({d}) ──", .{bom.config_issues.len}),
-            .title_marked = "",
-            .title_selected = "",
-            .title_marked_selected = "",
-            .title_style = .{ .bold = true, .fg = palette.accent, .dim = true },
-            .detail = try arena.dupe(Segment, &[_]Segment{
-                .{ .text = "configuration issues\n\n", .style = .{ .bold = true, .fg = palette.heading } },
-                .{ .text = "Misconfigurations from Dockerfile / k8s / OCI image-config.\n", .style = .{ .fg = palette.dim } },
-            }),
-            .category = .heading_config,
-        });
+        // Partition: hardening tab gets binary-level findings (hardening
+        // flags BIN-*, anti-tampering anomalies BIN-ANOM-*, YARA matches);
+        // config tab keeps Dockerfile / k8s / OCI image-config issues.
+        var n_hardening: usize = 0;
+        var n_config: usize = 0;
         for (bom.config_issues) |it| {
-            const sev_color = issueSeverityColor(it.severity);
-            const title = try std.fmt.allocPrint(arena, "  {s:<10} [{s}]  {s}", .{
-                it.rule_id,
-                @tagName(it.severity),
-                it.title,
-            });
-            const detail = try arena.dupe(Segment, &[_]Segment{
-                .{ .text = it.rule_id, .style = .{ .bold = true, .fg = palette.heading } },
-                .{ .text = "  ", .style = .{} },
-                .{ .text = @tagName(it.severity), .style = .{ .bold = true, .fg = sev_color } },
-                .{ .text = "\n", .style = .{} },
-                .{ .text = it.title, .style = .{ .fg = palette.fg, .bold = true } },
-                .{ .text = "\n\n", .style = .{} },
-                .{ .text = "source:    ", .style = .{ .fg = palette.dim } },
-                .{ .text = @tagName(it.source), .style = .{ .fg = palette.fg } },
-                .{ .text = "\nfile:      ", .style = .{ .fg = palette.dim } },
-                .{
-                    .text = try std.fmt.allocPrint(arena, "{s}:{d}", .{ it.file, it.line }),
-                    .style = .{ .fg = palette.fg },
-                },
-                .{ .text = "\n\nsnippet:\n", .style = .{ .fg = palette.dim } },
-                .{
-                    .text = if (it.snippet.len > 0) it.snippet else "(no snippet)",
-                    .style = .{ .fg = palette.fg },
-                },
-                .{ .text = "\n\nfix:       ", .style = .{ .fg = palette.dim } },
-                .{
-                    .text = if (it.recommendation.len > 0) it.recommendation else "(no recommendation)",
-                    .style = .{ .fg = palette.ok },
-                },
-                .{ .text = "\n", .style = .{} },
-            });
+            if (isHardeningRule(it.rule_id)) n_hardening += 1 else n_config += 1;
+        }
+
+        if (n_hardening > 0) {
             try list.append(arena, .{
-                .title_plain = title,
-            .title_marked = "",
-            .title_selected = "",
-            .title_marked_selected = "",
-                .title_style = .{ .fg = sev_color },
-                .detail = detail,
-                .category = .config,
+                .title_plain = try std.fmt.allocPrint(arena, "── hardening ({d}) ──", .{n_hardening}),
+                .title_marked = "",
+                .title_selected = "",
+                .title_marked_selected = "",
+                .title_style = .{ .bold = true, .fg = palette.accent, .dim = true },
+                .detail = try arena.dupe(Segment, &[_]Segment{
+                    .{ .text = "hardening\n\n", .style = .{ .bold = true, .fg = palette.heading } },
+                    .{ .text = "Exploit-mitigation flags, anti-tampering anomalies, and YARA rule matches.\n", .style = .{ .fg = palette.dim } },
+                }),
+                .category = .heading_hardening,
             });
+            for (bom.config_issues) |it| {
+                if (!isHardeningRule(it.rule_id)) continue;
+                try appendIssueItem(arena, &list, it, .hardening);
+            }
+        }
+
+        if (n_config > 0) {
+            try list.append(arena, .{
+                .title_plain = try std.fmt.allocPrint(arena, "── config issues ({d}) ──", .{n_config}),
+                .title_marked = "",
+                .title_selected = "",
+                .title_marked_selected = "",
+                .title_style = .{ .bold = true, .fg = palette.accent, .dim = true },
+                .detail = try arena.dupe(Segment, &[_]Segment{
+                    .{ .text = "configuration issues\n\n", .style = .{ .bold = true, .fg = palette.heading } },
+                    .{ .text = "Misconfigurations from Dockerfile / k8s / OCI image-config.\n", .style = .{ .fg = palette.dim } },
+                }),
+                .category = .heading_config,
+            });
+            for (bom.config_issues) |it| {
+                if (isHardeningRule(it.rule_id)) continue;
+                try appendIssueItem(arena, &list, it, .config);
+            }
         }
     }
 
@@ -1300,6 +1300,59 @@ fn buildItems(arena: Allocator, bom: *const scribe.sbom.Sbom, source: []const u8
         it.title_marked_selected = try std.fmt.allocPrint(arena, "▸★ {s}", .{body});
     }
     return items;
+}
+
+fn isHardeningRule(rule_id: []const u8) bool {
+    return std.mem.startsWith(u8, rule_id, "BIN-") or std.mem.startsWith(u8, rule_id, "YARA-");
+}
+
+fn appendIssueItem(
+    arena: Allocator,
+    list: *std.ArrayList(Item),
+    it: scribe.security.config.Issue,
+    cat: Category,
+) !void {
+    const sev_color = issueSeverityColor(it.severity);
+    const title = try std.fmt.allocPrint(arena, "  {s:<10} [{s}]  {s}", .{
+        it.rule_id,
+        @tagName(it.severity),
+        it.title,
+    });
+    const detail = try arena.dupe(Segment, &[_]Segment{
+        .{ .text = it.rule_id, .style = .{ .bold = true, .fg = palette.heading } },
+        .{ .text = "  ", .style = .{} },
+        .{ .text = @tagName(it.severity), .style = .{ .bold = true, .fg = sev_color } },
+        .{ .text = "\n", .style = .{} },
+        .{ .text = it.title, .style = .{ .fg = palette.fg, .bold = true } },
+        .{ .text = "\n\n", .style = .{} },
+        .{ .text = "source:    ", .style = .{ .fg = palette.dim } },
+        .{ .text = @tagName(it.source), .style = .{ .fg = palette.fg } },
+        .{ .text = "\nfile:      ", .style = .{ .fg = palette.dim } },
+        .{
+            .text = try std.fmt.allocPrint(arena, "{s}:{d}", .{ it.file, it.line }),
+            .style = .{ .fg = palette.fg },
+        },
+        .{ .text = "\n\nsnippet:\n", .style = .{ .fg = palette.dim } },
+        .{
+            .text = if (it.snippet.len > 0) it.snippet else "(no snippet)",
+            .style = .{ .fg = palette.fg },
+        },
+        .{ .text = "\n\nfix:       ", .style = .{ .fg = palette.dim } },
+        .{
+            .text = if (it.recommendation.len > 0) it.recommendation else "(no recommendation)",
+            .style = .{ .fg = palette.ok },
+        },
+        .{ .text = "\n", .style = .{} },
+    });
+    try list.append(arena, .{
+        .title_plain = title,
+        .title_marked = "",
+        .title_selected = "",
+        .title_marked_selected = "",
+        .title_style = .{ .fg = sev_color },
+        .detail = detail,
+        .category = cat,
+    });
 }
 
 fn componentsHeaderDetail(arena: Allocator, n: usize) ![]const Segment {
