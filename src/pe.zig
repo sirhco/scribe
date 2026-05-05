@@ -41,11 +41,11 @@ pub const PeInfo = struct {
 
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ScribeError!PeInfo {
     if (bytes.len < 0x40) return error.Truncated;
-    if (bytes[0] != 'M' or bytes[1] != 'Z') return error.NotElf;
+    if (bytes[0] != 'M' or bytes[1] != 'Z') return error.UnsupportedFormat;
 
     const coff = std.coff.Coff.init(bytes, false) catch |e| switch (e) {
         error.EndOfStream => return error.Truncated,
-        error.MissingPEHeader => return error.NotElf,
+        error.MissingPEHeader => return error.UnsupportedFormat,
     };
 
     const hdr = coff.getHeader();
@@ -89,7 +89,7 @@ fn entryPoint(coff: std.coff.Coff, is_64: bool) u64 {
 
 test "parse rejects non-PE magic" {
     const bytes = [_]u8{ 0, 0, 0, 0 } ++ ([_]u8{0} ** 0x40);
-    try std.testing.expectError(error.NotElf, parse(std.testing.allocator, &bytes));
+    try std.testing.expectError(error.UnsupportedFormat, parse(std.testing.allocator, &bytes));
 }
 
 test "parse golden pe x86_64 fixture" {

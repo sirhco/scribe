@@ -52,6 +52,10 @@ pub const ConfigIssue = security.config.Issue;
 pub const auditConfig = security.config.audit;
 pub const Policy = security.policy.Policy;
 pub const evaluatePolicy = security.policy.evaluate;
+pub const HardeningReport = security.hardening.Report;
+pub const HardeningCheck = security.hardening.Check;
+pub const HardeningStatus = security.hardening.Status;
+pub const analyzeHardening = security.hardening.analyze;
 
 test {
     std.testing.refAllDecls(@This());

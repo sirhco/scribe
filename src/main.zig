@@ -8,7 +8,8 @@ const usage =
     \\scribe — binary forensics
     \\
     \\Usage:
-    \\  scribe info <path>             format, arch, entry, sections
+    \\  scribe info <path>             format, arch, entry, sections, hardening
+    \\  scribe harden <path> [--json]  exploit-mitigation report (PIE/NX/RELRO/CFG/...)
     \\  scribe deps <path>             dynamic library dependencies
     \\  scribe strings <path> [min]    printable ASCII runs (default min=4)
     \\  scribe entropy <path>          Shannon entropy per section
@@ -64,7 +65,16 @@ pub fn main(init: std.process.Init) !void {
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "info")) {
         if (args.len < 3) return die(stderr, "error: 'info' requires a path\n", 1);
-        runInfo(io, gpa, stdout, args[2]) catch |err| return dieErr(stderr, err);
+        runInfo(io, gpa, stdout, args[2], style) catch |err| return dieErr(stderr, err);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "harden")) {
+        if (args.len < 3) return die(stderr, "error: 'harden' requires a path\n", 1);
+        var json = false;
+        for (args[3..]) |a| {
+            if (std.mem.eql(u8, a, "--json")) json = true;
+        }
+        runHarden(io, gpa, stdout, args[2], json, style) catch |err| return dieErr(stderr, err);
         return;
     }
     if (std.mem.eql(u8, cmd, "deps")) {
@@ -379,7 +389,13 @@ fn dieErr(stderr: *Io.Writer, err: anyerror) noreturn {
     std.process.exit(1);
 }
 
-fn runInfo(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, path: []const u8) !void {
+fn runInfo(
+    io: Io,
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    path: []const u8,
+    style: scribe.term.Style,
+) !void {
     var mapping = try scribe.mmap.open(io, path);
     defer mapping.deinit();
     const bytes = mapping.bytes();
@@ -390,12 +406,87 @@ fn runInfo(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, path: []const u8) !v
     try out.print("file:    {s}\n", .{path});
     try out.print("format:  {s}\n", .{@tagName(info)});
     try out.print("arch:    {s}\n", .{@tagName(info.arch())});
+    if (info == .macho) {
+        if (info.macho.fat_slice_arch) |slice_arch| {
+            try out.print("slice:   {s} (selected from FAT/Universal binary)\n", .{@tagName(slice_arch)});
+        }
+    }
     try out.print("entry:   0x{x}\n", .{info.entry()});
     try out.print("64-bit:  {}\n", .{info.is64()});
     switch (info) {
         .elf => |e| try printElfSections(out, e),
         .macho => |m| try printMachoSections(out, m),
         .pe => |p| try printPeSections(out, p),
+    }
+
+    var report = scribe.analyzeHardening(gpa, info, bytes) catch |e| {
+        try out.print("hardening: (unavailable: {s})\n", .{@errorName(e)});
+        return;
+    };
+    defer report.deinit(gpa);
+    try printHardening(out, report, style);
+}
+
+fn runHarden(
+    io: Io,
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    path: []const u8,
+    json: bool,
+    style: scribe.term.Style,
+) !void {
+    var mapping = try scribe.mmap.open(io, path);
+    defer mapping.deinit();
+    const bytes = mapping.bytes();
+
+    var info = try scribe.parseFormat(gpa, bytes);
+    defer info.deinit(gpa);
+
+    var report = try scribe.analyzeHardening(gpa, info, bytes);
+    defer report.deinit(gpa);
+
+    if (json) {
+        try out.print("{{\"file\":\"{s}\",\"format\":\"{s}\",\"checks\":[", .{ path, @tagName(report.format) });
+        for (report.checks, 0..) |c, i| {
+            if (i != 0) try out.writeAll(",");
+            try out.print("{{\"id\":\"{s}\",\"name\":\"{s}\",\"status\":\"{s}\"", .{ c.id, c.name, c.status.label() });
+            if (c.detail) |d| {
+                try out.print(",\"detail\":\"{s}\"", .{d});
+            }
+            try out.writeAll("}");
+        }
+        try out.writeAll("]}\n");
+        return;
+    }
+
+    try out.print("file:    {s}\n", .{path});
+    try out.print("format:  {s}\n", .{@tagName(report.format)});
+    try printHardening(out, report, style);
+}
+
+fn printHardening(out: *Io.Writer, report: scribe.HardeningReport, style: scribe.term.Style) !void {
+    try out.print("hardening: {d}\n", .{report.checks.len});
+    for (report.checks) |c| {
+        const code = switch (c.status) {
+            .enabled => "32",   // green
+            .partial => "33",   // yellow
+            .disabled => "31",  // red
+            .unknown => "90",   // dim
+            .na => "90",
+        };
+        if (style.enabled) {
+            try out.print(
+                "  {s:<18} \x1b[{s}m{s:<8}\x1b[0m {s}",
+                .{ c.id, code, c.status.label(), c.name },
+            );
+        } else {
+            try out.print(
+                "  {s:<18} {s:<8} {s}",
+                .{ c.id, c.status.label(), c.name },
+            );
+        }
+        if (c.detail) |d| try out.print("  ({s})", .{d});
+        try out.writeByte('\n');
     }
 }
 
@@ -1035,6 +1126,33 @@ fn runScan(
     if (fp_db_path) |fp| {
         prog.step("matching fingerprints");
         try augmentBomWithFingerprint(io, gpa, bytes, fp, &bom);
+    }
+
+    // Hardening pass — only meaningful on a single binary target. Container
+    // sources iterate per-bundled-binary themselves; skip for now to avoid
+    // duplicating image_config issues.
+    if (!scribe.container.isContainer(bytes)) {
+        prog.step("checking exploit mitigations");
+        if (scribe.parseFormat(gpa, bytes)) |fmt_info_const| {
+            var fmt_info = fmt_info_const;
+            defer fmt_info.deinit(gpa);
+            if (scribe.analyzeHardening(gpa, fmt_info, bytes)) |report_const| {
+                var report = report_const;
+                defer report.deinit(gpa);
+                if (scribe.security.hardening.toConfigIssues(gpa, report, target_path)) |hard_issues| {
+                    if (hard_issues.len > 0) {
+                        const merged = try gpa.alloc(scribe.security.config.Issue, bom.config_issues.len + hard_issues.len);
+                        @memcpy(merged[0..bom.config_issues.len], bom.config_issues);
+                        @memcpy(merged[bom.config_issues.len..], hard_issues);
+                        gpa.free(bom.config_issues);
+                        gpa.free(hard_issues);
+                        bom.config_issues = merged;
+                    } else {
+                        gpa.free(hard_issues);
+                    }
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
     }
 
     if (db_path) |dp| {

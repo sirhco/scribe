@@ -41,6 +41,7 @@ pub const SectionHeader = struct {
 pub const ElfInfo = struct {
     arch: Arch,
     machine: std.elf.EM,
+    e_type: u16,
     entry: u64,
     is_64: bool,
     endian: std.builtin.Endian,
@@ -54,11 +55,11 @@ pub const ElfInfo = struct {
 
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ScribeError!ElfInfo {
     if (bytes.len < @sizeOf(std.elf.Elf64_Ehdr)) return error.Truncated;
-    if (!std.mem.eql(u8, bytes[0..4], std.elf.MAGIC)) return error.NotElf;
+    if (!std.mem.eql(u8, bytes[0..4], std.elf.MAGIC)) return error.UnsupportedFormat;
 
     var hdr_reader: std.Io.Reader = .fixed(bytes);
     const header = std.elf.Header.read(&hdr_reader) catch |e| switch (e) {
-        error.InvalidElfMagic => return error.NotElf,
+        error.InvalidElfMagic => return error.UnsupportedFormat,
         error.InvalidElfVersion => return error.UnsupportedVersion,
         error.InvalidElfClass => return error.UnsupportedClass,
         error.InvalidElfEndian => return error.UnsupportedEndian,
@@ -103,6 +104,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ScribeError!ElfInf
     return .{
         .arch = archFromMachine(header.machine),
         .machine = header.machine,
+        .e_type = @intFromEnum(header.type),
         .entry = header.entry,
         .is_64 = header.is_64,
         .endian = header.endian,
@@ -158,7 +160,7 @@ fn makeMinimalHeader() [64]u8 {
 
 test "parse rejects non-ELF magic" {
     const bytes = [_]u8{ 'M', 'Z', 0, 0 } ++ ([_]u8{0} ** 60);
-    try std.testing.expectError(error.NotElf, parse(std.testing.allocator, &bytes));
+    try std.testing.expectError(error.UnsupportedFormat, parse(std.testing.allocator, &bytes));
 }
 
 test "parse rejects truncated header" {

@@ -24,12 +24,14 @@ pub fn collect(allocator: std.mem.Allocator, bytes: []const u8) ScribeError![]De
         m == std.macho.MH_MAGIC or m == std.macho.MH_CIGAM)
         return collectMacho(allocator, bytes);
     if (bytes[0] == 'M' and bytes[1] == 'Z') return collectPe(allocator, bytes);
-    return error.NotElf;
+    if (m == 0xCAFEBABE or m == 0xBEBAFECA or m == 0xCAFEBABF or m == 0xBFBAFECA)
+        return collectMacho(allocator, bytes);
+    return error.UnsupportedFormat;
 }
 
 fn collectElf(allocator: std.mem.Allocator, bytes: []const u8) ScribeError![]Dep {
     var hdr_reader: std.Io.Reader = .fixed(bytes);
-    const header = std.elf.Header.read(&hdr_reader) catch return error.NotElf;
+    const header = std.elf.Header.read(&hdr_reader) catch return error.UnsupportedFormat;
 
     // Find PT_DYNAMIC program header.
     var ph_it = header.iterateProgramHeadersBuffer(bytes);
@@ -126,7 +128,7 @@ fn collectMacho(allocator: std.mem.Allocator, bytes: []const u8) ScribeError![]D
 fn collectPe(allocator: std.mem.Allocator, bytes: []const u8) ScribeError![]Dep {
     const coff = std.coff.Coff.init(bytes, false) catch |e| switch (e) {
         error.EndOfStream => return error.Truncated,
-        error.MissingPEHeader => return error.NotElf,
+        error.MissingPEHeader => return error.UnsupportedFormat,
     };
 
     const dirs = coff.getDataDirectories();

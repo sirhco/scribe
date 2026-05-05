@@ -10,7 +10,8 @@ Scribe is a high-performance, cross-platform binary forensics library and CLI wr
 - [Install](#install)
 - [Quick start](#quick-start)
 - [CLI reference](#cli-reference)
-  - [`scribe info`](#scribe-info-path) — format, arch, sections
+  - [`scribe info`](#scribe-info-path) — format, arch, sections, hardening
+  - [`scribe harden`](#scribe-harden-path) — exploit-mitigation report
   - [`scribe deps`](#scribe-deps-path) — dynamic dependencies
   - [`scribe strings`](#scribe-strings-path-min) — printable runs (SIMD)
   - [`scribe entropy`](#scribe-entropy-path) — Shannon entropy per section
@@ -67,10 +68,8 @@ cd scribe
 zig build                # produces zig-out/bin/scribe
 zig build test           # runs the test suite
 
-# Optional: put it on PATH so the examples below work without ./zig-out/bin/ prefix.
-export PATH="$PWD/zig-out/bin:$PATH"
-# Or override the install prefix:
-sudo zig build --prefix /usr/local install   # writes /usr/local/bin/scribe
+# Install to local machine 
+zig build install --prefix ~/.local -Doptimize=ReleaseFast
 ```
 
 `zig build install` and plain `zig build` both write to
@@ -153,6 +152,52 @@ sections: 12
 
 For Mach-O, sections are printed as `<segment>/<section>` (e.g. `__TEXT/__text`).
 For PE, sections include `image base` and virtual/raw size pairs.
+
+### `scribe harden <path>`
+
+Reports the binary's exploit-mitigation posture across ELF, Mach-O, and
+PE. Cross-format coverage:
+
+| Check          | ELF | Mach-O | PE  | Meaning                                |
+| -------------- | --- | ------ | --- | -------------------------------------- |
+| `PIE`          | ✓   | ✓      | —   | Position-independent (loader can ASLR) |
+| `NX` / `NX_HEAP` | ✓ | ✓      | —   | Non-executable stack/heap              |
+| `RELRO`        | ✓   | —      | —   | GOT read-only after relocation         |
+| `CANARY`       | ✓   | ✓      | —   | Stack-smashing protector linked        |
+| `FORTIFY`      | ✓   | —      | —   | `_FORTIFY_SOURCE` libc wrappers        |
+| `STRIPPED`     | ✓   | —      | —   | `.symtab` removed (informational)      |
+| `RPATH`        | ✓   | ✓      | —   | Embedded library search path           |
+| `CODE_SIG`     | —   | ✓      | —   | `LC_CODE_SIGNATURE` blob present       |
+| `ENCRYPTED`    | —   | ✓      | —   | `LC_ENCRYPTION_INFO[_64]` cryptid set  |
+| `STACK_EXEC`   | —   | ✓      | —   | `MH_ALLOW_STACK_EXECUTION` (risky)     |
+| `ASLR`         | —   | —      | ✓   | `IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE`|
+| `HIGH_ENTROPY_VA` | — | —     | ✓   | 64-bit high-entropy ASLR               |
+| `DEP`          | —   | —      | ✓   | `NX_COMPAT` flag                       |
+| `CFG`          | —   | —      | ✓   | Control Flow Guard                     |
+| `GS`           | —   | —      | ✓   | Stack buffer overflow check (cookie)   |
+| `SAFESEH`      | —   | —      | ✓   | 32-bit Safe SEH                        |
+| `AUTHENTICODE` | —   | —      | ✓   | Certificate table populated            |
+
+```sh
+$ scribe harden /bin/zsh
+file:    /bin/zsh
+format:  macho
+hardening: 6
+  PIE                enabled  Position-Independent Executable
+  NX_HEAP            disabled Non-executable heap
+  STACK_EXEC         disabled Allow stack execution
+  CODE_SIG           enabled  Code signature
+  ENCRYPTED          disabled FairPlay encrypted
+  CANARY             enabled  Stack canary
+
+$ scribe harden ./myapp --json | jq .checks[0]
+{ "id": "PIE", "name": "Position-Independent Executable", "status": "enabled" }
+```
+
+`scribe scan` rolls hardening checks into its config-issues stream
+(severity `medium` for missing core protections, `low` for missing
+defense-in-depth, `info` for risky-but-on settings), so they flow
+through `scribe policy` and the TUI without bespoke wiring.
 
 ### `scribe deps <path>`
 
@@ -643,9 +688,12 @@ The `scribe ui` subcommand lives in `src/ui.zig` (executable-only, not part of t
   does not (yet) parse the PDB file itself. Address symbolication on PE
   requires the matching `.pdb` and PDB parsing — neither currently
   implemented in std nor in scribe.
-- **FAT Mach-O**: universal binaries (FAT magic) return
-  `error.UnsupportedClass`. Pre-extract a slice with `lipo -extract` for
-  now.
+- **FAT Mach-O**: universal binaries (FAT magic) are auto-resolved — the
+  parser picks the slice matching the host CPU (`x86_64` on Intel,
+  `aarch64` on Apple Silicon) and falls back to the first slice when no
+  exact match exists. `scribe info` surfaces the chosen slice via a
+  `slice:` line. 32-bit Mach-O (`MH_MAGIC`) is also supported, though
+  rarely encountered on modern macOS.
 - **Fingerprint robustness**: each entry carries both a raw Wyhash and a
   normalized Wyhash. The normalizer zeros the disp32 of E8/E9/0F8x
   branches and of RIP-relative ModR/M loads/stores/LEAs/indirect-calls

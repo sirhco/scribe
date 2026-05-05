@@ -6,3 +6,4 @@ pub const secrets = @import("secrets.zig");
 pub const vulnerability = @import("vulnerability.zig");
 pub const config = @import("config.zig");
 pub const policy = @import("policy.zig");
+pub const hardening = @import("hardening.zig");

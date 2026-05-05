@@ -51,9 +51,16 @@ pub fn detect(bytes: []const u8) errors.ScribeError!Kind {
         if (m == std.macho.MH_MAGIC or m == std.macho.MH_CIGAM or
             m == std.macho.MH_MAGIC_64 or m == std.macho.MH_CIGAM_64)
             return .macho;
+        // FAT/Universal Mach-O magics (stored big-endian on disk; little-endian
+        // read flips them). Recognize all four so /bin/zsh and other stock
+        // macOS binaries route through the Mach-O parser, which carves out
+        // the host-arch slice itself.
+        if (m == std.macho.FAT_MAGIC or m == std.macho.FAT_CIGAM or
+            m == std.macho.FAT_MAGIC_64 or m == std.macho.FAT_CIGAM_64)
+            return .macho;
     }
     if (bytes.len >= 2 and bytes[0] == 'M' and bytes[1] == 'Z') return .pe;
-    return error.NotElf;
+    return error.UnsupportedFormat;
 }
 
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) errors.ScribeError!Info {
@@ -82,5 +89,18 @@ test "detect PE" {
 
 test "detect rejects unknown" {
     const bytes = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF } ++ ([_]u8{0} ** 12);
-    try std.testing.expectError(error.NotElf, detect(&bytes));
+    try std.testing.expectError(error.UnsupportedFormat, detect(&bytes));
+}
+
+test "detect FAT Mach-O magics" {
+    inline for (.{
+        std.macho.FAT_MAGIC,
+        std.macho.FAT_CIGAM,
+        std.macho.FAT_MAGIC_64,
+        std.macho.FAT_CIGAM_64,
+    }) |m| {
+        var bytes: [16]u8 = @splat(0);
+        std.mem.writeInt(u32, bytes[0..4], m, .little);
+        try std.testing.expectEqual(Kind.macho, try detect(&bytes));
+    }
 }

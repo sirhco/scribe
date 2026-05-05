@@ -1,5 +1,5 @@
 pub const ScribeError = error{
-    NotElf,
+    UnsupportedFormat,
     Truncated,
     UnsupportedClass,
     UnsupportedEndian,
