@@ -19,6 +19,8 @@ const errors = @import("errors.zig");
 const sbom_mod = @import("sbom.zig");
 const format = @import("format.zig");
 const security_config = @import("security/config.zig");
+const hardening = @import("security/hardening.zig");
+const anomalies = @import("security/anomalies.zig");
 
 pub const ImageSbom = struct {
     components: []sbom_mod.Component,
@@ -133,6 +135,31 @@ pub fn collectFromBlobs(
                     components.append(allocator, c2) catch return error.OutOfMemory;
                 }
                 allocator.free(sub.components);
+
+                // Per-binary hardening + anomaly pass. Folds findings into the
+                // image-level config_issues so the TUI / scan output sees
+                // exploit-mitigation gaps inside container layers, not just on
+                // standalone binary targets.
+                if (format.parse(allocator, file_bytes)) |fmt_info_const| {
+                    var fmt_info = fmt_info_const;
+                    defer fmt_info.deinit(allocator);
+                    if (hardening.analyze(allocator, fmt_info, file_bytes)) |hr_const| {
+                        var hr = hr_const;
+                        defer hr.deinit(allocator);
+                        if (hardening.toConfigIssues(allocator, hr, file_path)) |hi| {
+                            for (hi) |is| config_issues.append(allocator, is) catch {};
+                            allocator.free(hi);
+                        } else |_| {}
+                    } else |_| {}
+                    if (anomalies.analyze(allocator, fmt_info, file_bytes)) |ar_const| {
+                        var ar = ar_const;
+                        defer ar.deinit(allocator);
+                        if (anomalies.toConfigIssues(allocator, ar, file_path)) |ai| {
+                            for (ai) |is| config_issues.append(allocator, is) catch {};
+                            allocator.free(ai);
+                        } else |_| {}
+                    } else |_| {}
+                } else |_| {}
                 continue;
             }
 

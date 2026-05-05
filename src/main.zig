@@ -4,6 +4,8 @@ const Io = std.Io;
 const scribe = @import("scribe");
 const ui = @import("ui.zig");
 
+const scribe_version = "0.2.0";
+
 const usage =
     \\scribe — binary forensics
     \\
@@ -11,9 +13,12 @@ const usage =
     \\  scribe info <path>             format, arch, entry, sections, hardening
     \\  scribe harden <path> [--json]  exploit-mitigation report (PIE/NX/RELRO/CFG/...)
     \\  scribe yara <path> --rules <p> match a YARA-subset rule file ([--json])
-    \\  scribe deps <path>             dynamic library dependencies
-    \\  scribe strings <path> [min]    printable ASCII runs (default min=4)
-    \\  scribe entropy <path>          Shannon entropy per section
+    \\  scribe deps <path> [--json]    dynamic library dependencies
+    \\  scribe strings <path> [min]    printable ASCII runs (default min=4) [--json]
+    \\  scribe entropy <path> [--json] Shannon entropy per section
+    \\  scribe hex <path> [opts]       hex + ASCII dump ([--offset 0x..] [--length N] [--section name])
+    \\  scribe exports <path> [--json] dynamically-exported symbols
+    \\  scribe diff <a> <b> [--json]   structural diff: arch, sections, deps, hardening
     \\  scribe sbom <path> [--plain]   bill of materials (CycloneDX 1.5 by default; --plain for human)
     \\  scribe secrets <path> [opts]   SIMD secret scan ([--json] [--include-generic] [--include-wide] [--min-entropy N])
     \\  scribe vulns <path> --db <p>   match SBOM components against advisory DB ([--json])
@@ -64,9 +69,28 @@ pub fn main(init: std.process.Init) !void {
     if (args.len < 2) return die(stderr, usage, 1);
 
     const cmd = args[1];
+    if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-V") or std.mem.eql(u8, cmd, "version")) {
+        try stdout.print("scribe {s}\n", .{scribe_version});
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "help")) {
+        try stdout.writeAll(usage);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "completion")) {
+        if (args.len < 3) return die(stderr, "error: 'completion' requires shell name (bash|zsh|fish)\n", 1);
+        try emitCompletion(stdout, args[2]);
+        return;
+    }
     if (std.mem.eql(u8, cmd, "info")) {
         if (args.len < 3) return die(stderr, "error: 'info' requires a path\n", 1);
-        runInfo(io, gpa, stdout, args[2], style) catch |err| return dieErr(stderr, err);
+        var json = false;
+        var all_slices = false;
+        for (args[3..]) |a| {
+            if (std.mem.eql(u8, a, "--json")) json = true;
+            if (std.mem.eql(u8, a, "--all-slices")) all_slices = true;
+        }
+        runInfo(io, gpa, stdout, args[2], json, all_slices, style) catch |err| return dieErr(stderr, err);
         return;
     }
     if (std.mem.eql(u8, cmd, "harden")) {
@@ -76,6 +100,48 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, a, "--json")) json = true;
         }
         runHarden(io, gpa, stdout, args[2], json, style) catch |err| return dieErr(stderr, err);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "hex")) {
+        if (args.len < 3) return die(stderr, "error: 'hex' requires a path\n", 1);
+        var off_opt: ?u64 = null;
+        var len_opt: ?usize = null;
+        var section: ?[]const u8 = null;
+        var idx: usize = 3;
+        while (idx < args.len) : (idx += 1) {
+            const a = args[idx];
+            if (std.mem.eql(u8, a, "--offset")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --offset requires a value\n", 1);
+                idx += 1;
+                off_opt = std.fmt.parseInt(u64, stripHexPrefix(args[idx]), 16) catch
+                    std.fmt.parseInt(u64, args[idx], 10) catch return die(stderr, "error: invalid --offset\n", 1);
+            } else if (std.mem.eql(u8, a, "--length")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --length requires a value\n", 1);
+                idx += 1;
+                len_opt = std.fmt.parseInt(usize, args[idx], 10) catch return die(stderr, "error: invalid --length\n", 1);
+            } else if (std.mem.eql(u8, a, "--section")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --section requires a name\n", 1);
+                idx += 1;
+                section = args[idx];
+            } else {
+                return die(stderr, "error: unknown 'hex' option\n", 1);
+            }
+        }
+        runHex(io, gpa, stdout, args[2], off_opt, len_opt, section) catch |err| return dieErr(stderr, err);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "exports")) {
+        if (args.len < 3) return die(stderr, "error: 'exports' requires a path\n", 1);
+        var json = false;
+        for (args[3..]) |a| if (std.mem.eql(u8, a, "--json")) { json = true; };
+        runExports(io, gpa, stdout, args[2], json) catch |err| return dieErr(stderr, err);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "diff")) {
+        if (args.len < 4) return die(stderr, "error: 'diff' requires two paths\n", 1);
+        var json = false;
+        for (args[4..]) |a| if (std.mem.eql(u8, a, "--json")) { json = true; };
+        runDiff(io, gpa, stdout, args[2], args[3], json, style) catch |err| return dieErr(stderr, err);
         return;
     }
     if (std.mem.eql(u8, cmd, "yara")) {
@@ -101,22 +167,33 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, cmd, "deps")) {
         if (args.len < 3) return die(stderr, "error: 'deps' requires a path\n", 1);
-        runDeps(io, gpa, stdout, args[2]) catch |err| return dieErr(stderr, err);
+        var json = false;
+        for (args[3..]) |a| if (std.mem.eql(u8, a, "--json")) { json = true; };
+        runDeps(io, gpa, stdout, args[2], json) catch |err| return dieErr(stderr, err);
         return;
     }
     if (std.mem.eql(u8, cmd, "strings")) {
         if (args.len < 3) return die(stderr, "error: 'strings' requires a path\n", 1);
-        const min: usize = if (args.len >= 4)
-            std.fmt.parseInt(usize, args[3], 10) catch
-                return die(stderr, "error: invalid min length\n", 1)
-        else
-            4;
-        runStrings(io, stdout, args[2], min) catch |err| return dieErr(stderr, err);
+        var json = false;
+        var min: usize = 4;
+        var idx: usize = 3;
+        while (idx < args.len) : (idx += 1) {
+            const a = args[idx];
+            if (std.mem.eql(u8, a, "--json")) {
+                json = true;
+            } else {
+                min = std.fmt.parseInt(usize, a, 10) catch
+                    return die(stderr, "error: invalid min length or unknown 'strings' option\n", 1);
+            }
+        }
+        runStrings(io, stdout, args[2], min, json) catch |err| return dieErr(stderr, err);
         return;
     }
     if (std.mem.eql(u8, cmd, "entropy")) {
         if (args.len < 3) return die(stderr, "error: 'entropy' requires a path\n", 1);
-        runEntropy(io, gpa, stdout, args[2]) catch |err| return dieErr(stderr, err);
+        var json = false;
+        for (args[3..]) |a| if (std.mem.eql(u8, a, "--json")) { json = true; };
+        runEntropy(io, gpa, stdout, args[2], json) catch |err| return dieErr(stderr, err);
         return;
     }
     if (std.mem.eql(u8, cmd, "fp")) {
@@ -404,6 +481,113 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(1);
 }
 
+fn emitCompletion(out: *Io.Writer, shell: []const u8) !void {
+    if (std.mem.eql(u8, shell, "bash")) {
+        try out.writeAll(bash_completion);
+        return;
+    }
+    if (std.mem.eql(u8, shell, "zsh")) {
+        try out.writeAll(zsh_completion);
+        return;
+    }
+    if (std.mem.eql(u8, shell, "fish")) {
+        try out.writeAll(fish_completion);
+        return;
+    }
+    return error.NotImplemented;
+}
+
+const subcommand_list = "info harden yara deps strings entropy hex exports diff sbom secrets vulns config scan policy symbols addr2line fp ui completion vulndb help version";
+
+const bash_completion =
+    \\# scribe bash completion. Source: `source <(scribe completion bash)` or
+    \\# write to /etc/bash_completion.d/scribe.
+    \\_scribe() {
+    \\    local cur prev cmds
+    \\    COMPREPLY=()
+    \\    cur="${COMP_WORDS[COMP_CWORD]}"
+    \\    cmds="info harden yara deps strings entropy hex exports diff sbom secrets vulns config scan policy symbols addr2line fp ui completion vulndb help version --version --help"
+    \\    if [ "$COMP_CWORD" -eq 1 ]; then
+    \\        COMPREPLY=( $(compgen -W "$cmds" -- "$cur") )
+    \\        return 0
+    \\    fi
+    \\    COMPREPLY=( $(compgen -f -- "$cur") )
+    \\}
+    \\complete -F _scribe scribe
+    \\
+;
+
+const zsh_completion =
+    \\# scribe zsh completion. Source: `source <(scribe completion zsh)` or
+    \\# write to a directory on $fpath named _scribe.
+    \\#compdef scribe
+    \\_scribe() {
+    \\    local -a cmds
+    \\    cmds=(
+    \\        'info:format, arch, entry, sections, hardening'
+    \\        'harden:exploit-mitigation report'
+    \\        'yara:match a YARA-subset rule file'
+    \\        'deps:dynamic library dependencies'
+    \\        'strings:printable ASCII runs'
+    \\        'entropy:Shannon entropy per section'
+    \\        'hex:hex dump of file or section'
+    \\        'exports:list dynamically exported symbols'
+    \\        'diff:compare two binaries'
+    \\        'sbom:bill of materials (CycloneDX or plain)'
+    \\        'secrets:SIMD secret scan'
+    \\        'vulns:CVE / advisory matcher'
+    \\        'config:audit Dockerfile / k8s manifest'
+    \\        'scan:full pipeline (SBOM + secrets + vulns + IaC + hardening + anomalies + YARA)'
+    \\        'policy:evaluate scan results against policy'
+    \\        'symbols:DWARF function symbols'
+    \\        'addr2line:resolve address to source location'
+    \\        'fp:fingerprint database operations'
+    \\        'ui:interactive scan-results browser (TUI)'
+    \\        'vulndb:advisory DB management'
+    \\        'completion:emit shell completion script'
+    \\        'help:print usage'
+    \\        'version:print version'
+    \\    )
+    \\    if (( CURRENT == 2 )); then
+    \\        _describe 'command' cmds
+    \\    else
+    \\        _files
+    \\    fi
+    \\}
+    \\compdef _scribe scribe
+    \\
+;
+
+const fish_completion =
+    \\# scribe fish completion. Source: `scribe completion fish | source` or
+    \\# write to ~/.config/fish/completions/scribe.fish.
+    \\complete -c scribe -f
+    \\complete -c scribe -n '__fish_use_subcommand' -a info -d 'format, arch, sections, hardening'
+    \\complete -c scribe -n '__fish_use_subcommand' -a harden -d 'exploit-mitigation report'
+    \\complete -c scribe -n '__fish_use_subcommand' -a yara -d 'match YARA-subset rules'
+    \\complete -c scribe -n '__fish_use_subcommand' -a deps -d 'dynamic library dependencies'
+    \\complete -c scribe -n '__fish_use_subcommand' -a strings -d 'printable ASCII runs (SIMD)'
+    \\complete -c scribe -n '__fish_use_subcommand' -a entropy -d 'Shannon entropy per section'
+    \\complete -c scribe -n '__fish_use_subcommand' -a hex -d 'hex dump'
+    \\complete -c scribe -n '__fish_use_subcommand' -a exports -d 'exported symbols'
+    \\complete -c scribe -n '__fish_use_subcommand' -a diff -d 'compare two binaries'
+    \\complete -c scribe -n '__fish_use_subcommand' -a sbom -d 'CycloneDX SBOM'
+    \\complete -c scribe -n '__fish_use_subcommand' -a secrets -d 'SIMD secret scan'
+    \\complete -c scribe -n '__fish_use_subcommand' -a vulns -d 'CVE matcher'
+    \\complete -c scribe -n '__fish_use_subcommand' -a config -d 'IaC misconfig audit'
+    \\complete -c scribe -n '__fish_use_subcommand' -a scan -d 'full security pipeline'
+    \\complete -c scribe -n '__fish_use_subcommand' -a policy -d 'policy gate'
+    \\complete -c scribe -n '__fish_use_subcommand' -a symbols -d 'DWARF symbols'
+    \\complete -c scribe -n '__fish_use_subcommand' -a addr2line -d 'address to source'
+    \\complete -c scribe -n '__fish_use_subcommand' -a fp -d 'fingerprint DB'
+    \\complete -c scribe -n '__fish_use_subcommand' -a ui -d 'interactive TUI'
+    \\complete -c scribe -n '__fish_use_subcommand' -a vulndb -d 'advisory DB management'
+    \\complete -c scribe -n '__fish_use_subcommand' -a completion -d 'emit shell completion'
+    \\complete -c scribe -n '__fish_use_subcommand' -a help -d 'print usage'
+    \\complete -c scribe -n '__fish_use_subcommand' -a version -d 'print version'
+    \\
+;
+
 fn die(stderr: *Io.Writer, msg: []const u8, code: u8) noreturn {
     stderr.writeAll(msg) catch {};
     stderr.flush() catch {};
@@ -421,14 +605,59 @@ fn runInfo(
     gpa: std.mem.Allocator,
     out: *Io.Writer,
     path: []const u8,
+    json: bool,
+    all_slices: bool,
     style: scribe.term.Style,
 ) !void {
     var mapping = try scribe.mmap.open(io, path);
     defer mapping.deinit();
     const bytes = mapping.bytes();
 
+    if (all_slices) {
+        try emitAllSlices(out, bytes, gpa, path, json);
+        return;
+    }
+
     var info = try scribe.parseFormat(gpa, bytes);
     defer info.deinit(gpa);
+
+    if (json) {
+        try out.print("{{\"file\":\"{s}\",\"format\":\"{s}\",\"arch\":\"{s}\",\"entry\":\"0x{x}\",\"is_64\":{},\"sections\":[", .{
+            path, @tagName(info), @tagName(info.arch()), info.entry(), info.is64(),
+        });
+        switch (info) {
+            .elf => |e| for (e.sections, 0..) |s, i| {
+                if (i != 0) try out.writeAll(",");
+                try out.print("{{\"name\":\"{s}\",\"addr\":\"0x{x}\",\"size\":\"0x{x}\"}}", .{ s.name, s.addr, s.size });
+            },
+            .macho => |m| for (m.sections, 0..) |s, i| {
+                if (i != 0) try out.writeAll(",");
+                try out.print("{{\"seg\":\"{s}\",\"name\":\"{s}\",\"addr\":\"0x{x}\",\"size\":\"0x{x}\"}}", .{ s.seg, s.name, s.addr, s.size });
+            },
+            .pe => |p| for (p.sections, 0..) |s, i| {
+                if (i != 0) try out.writeAll(",");
+                try out.print("{{\"name\":\"{s}\",\"vaddr\":\"0x{x}\",\"vsize\":\"0x{x}\",\"raw\":\"0x{x}\"}}", .{ s.name, s.virtual_address, s.virtual_size, s.raw_size });
+            },
+        }
+        try out.writeAll("]");
+        if (info == .macho) {
+            if (info.macho.fat_slice_arch) |slice_arch| {
+                try out.print(",\"slice\":\"{s}\"", .{@tagName(slice_arch)});
+            }
+        }
+        if (scribe.analyzeHardening(gpa, info, bytes)) |report_const| {
+            var report = report_const;
+            defer report.deinit(gpa);
+            try out.writeAll(",\"hardening\":[");
+            for (report.checks, 0..) |c, i| {
+                if (i != 0) try out.writeAll(",");
+                try out.print("{{\"id\":\"{s}\",\"status\":\"{s}\"}}", .{ c.id, c.status.label() });
+            }
+            try out.writeAll("]");
+        } else |_| {}
+        try out.writeAll("}\n");
+        return;
+    }
 
     try out.print("file:    {s}\n", .{path});
     try out.print("format:  {s}\n", .{@tagName(info)});
@@ -452,6 +681,459 @@ fn runInfo(
     };
     defer report.deinit(gpa);
     try printHardening(out, report, style);
+}
+
+fn emitAllSlices(
+    out: *Io.Writer,
+    bytes: []const u8,
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    json: bool,
+) !void {
+    if (bytes.len < 8) return error.Truncated;
+    const m = std.mem.readInt(u32, bytes[0..4], .little);
+    const is_fat_64 = m == std.macho.FAT_MAGIC_64 or m == std.macho.FAT_CIGAM_64;
+    const is_fat = is_fat_64 or m == std.macho.FAT_MAGIC or m == std.macho.FAT_CIGAM;
+    if (!is_fat) {
+        // Not a FAT file — emit single-slice info.
+        if (json) try out.writeAll("{\"slices\":[") else try out.writeAll("(input is not a FAT/Universal binary; --all-slices applies only to Mach-O fat archives)\n");
+        if (json) try out.writeAll("]}\n");
+        return;
+    }
+    const nfat = std.mem.readInt(u32, bytes[4..8], .big);
+    const entry_size: usize = if (is_fat_64) 32 else 20;
+    const tail = std.math.add(usize, 8, entry_size * nfat) catch return error.Truncated;
+    if (tail > bytes.len) return error.Truncated;
+
+    if (json) try out.print("{{\"file\":\"{s}\",\"slices\":[", .{path}) else try out.print("file:    {s}\nslices:  {d}\n", .{ path, nfat });
+
+    var i: u32 = 0;
+    while (i < nfat) : (i += 1) {
+        const off: usize = 8 + i * entry_size;
+        const cputype = std.mem.readInt(i32, bytes[off..][0..4], .big);
+        const slice_off: u64 = if (is_fat_64)
+            std.mem.readInt(u64, bytes[off + 8 ..][0..8], .big)
+        else
+            std.mem.readInt(u32, bytes[off + 8 ..][0..4], .big);
+        const slice_size: u64 = if (is_fat_64)
+            std.mem.readInt(u64, bytes[off + 16 ..][0..8], .big)
+        else
+            std.mem.readInt(u32, bytes[off + 12 ..][0..4], .big);
+        const arch = scribe.macho.archFromCpu(cputype);
+        if (slice_off + slice_size > bytes.len) continue;
+        const slice = bytes[@intCast(slice_off)..@intCast(slice_off + slice_size)];
+
+        // Parse the thin slice for entry + section count.
+        var entry: u64 = 0;
+        var sections: usize = 0;
+        var info = scribe.macho.parse(gpa, slice) catch null;
+        defer if (info) |*ii| ii.deinit(gpa);
+        if (info) |ii| {
+            entry = ii.entry;
+            sections = ii.sections.len;
+        }
+
+        if (json) {
+            if (i != 0) try out.writeAll(",");
+            try out.print("{{\"index\":{d},\"arch\":\"{s}\",\"offset\":\"0x{x}\",\"size\":\"0x{x}\",\"entry\":\"0x{x}\",\"sections\":{d}}}", .{ i, @tagName(arch), slice_off, slice_size, entry, sections });
+        } else {
+            try out.print("  [{d}] arch={s:<8} offset=0x{x:0>8} size=0x{x} entry=0x{x} sections={d}\n", .{ i, @tagName(arch), slice_off, slice_size, entry, sections });
+        }
+    }
+    if (json) try out.writeAll("]}\n");
+}
+
+fn runHex(
+    io: Io,
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    path: []const u8,
+    off_opt: ?u64,
+    len_opt: ?usize,
+    section: ?[]const u8,
+) !void {
+    var mapping = try scribe.mmap.open(io, path);
+    defer mapping.deinit();
+    const bytes = mapping.bytes();
+
+    var start: u64 = off_opt orelse 0;
+    var len: usize = len_opt orelse 256;
+
+    if (section) |sec_name| {
+        var info = try scribe.parseFormat(gpa, bytes);
+        defer info.deinit(gpa);
+        const range = sectionRange(info, sec_name) orelse {
+            try out.print("error: section {s} not found\n", .{sec_name});
+            return;
+        };
+        start = range.offset;
+        if (len_opt == null) len = @min(range.size, 4096);
+    }
+
+    if (start > bytes.len) {
+        try out.print("error: offset 0x{x} past end of file (size 0x{x})\n", .{ start, bytes.len });
+        return;
+    }
+    const window = bytes[@intCast(start)..@min(bytes.len, @as(usize, @intCast(start)) + len)];
+    try writeHexDump(out, window, start);
+}
+
+const SectionRange = struct { offset: u64, size: u64 };
+
+fn sectionRange(info: scribe.FormatInfo, name: []const u8) ?SectionRange {
+    return switch (info) {
+        .elf => |e| blk: {
+            for (e.sections) |s| if (std.mem.eql(u8, s.name, name))
+                break :blk .{ .offset = s.offset, .size = s.size };
+            break :blk null;
+        },
+        .macho => |m| blk: {
+            // Section offsets are slice-relative; add fat_slice_offset so we
+            // index into the original FAT file correctly.
+            const base = m.fat_slice_offset;
+            // Accept "__text" (section name) or "__TEXT/__text" composite.
+            for (m.sections) |s| {
+                if (std.mem.eql(u8, s.name, name)) break :blk .{ .offset = base + s.offset, .size = s.size };
+                var buf: [64]u8 = undefined;
+                const composite = std.fmt.bufPrint(&buf, "{s}/{s}", .{ s.seg, s.name }) catch continue;
+                if (std.mem.eql(u8, composite, name)) break :blk .{ .offset = base + s.offset, .size = s.size };
+            }
+            break :blk null;
+        },
+        .pe => |p| blk: {
+            for (p.sections) |s| if (std.mem.eql(u8, s.name, name))
+                break :blk .{ .offset = s.raw_offset, .size = s.raw_size };
+            break :blk null;
+        },
+    };
+}
+
+fn writeHexDump(out: *Io.Writer, data: []const u8, base_offset: u64) !void {
+    var i: usize = 0;
+    while (i < data.len) : (i += 16) {
+        try out.print("{x:0>8}  ", .{base_offset + @as(u64, i)});
+        const row_end = @min(i + 16, data.len);
+        var k: usize = i;
+        while (k < i + 16) : (k += 1) {
+            if (k < row_end) {
+                try out.print("{x:0>2} ", .{data[k]});
+            } else {
+                try out.writeAll("   ");
+            }
+            if (k == i + 7) try out.writeAll(" ");
+        }
+        try out.writeAll(" |");
+        for (data[i..row_end]) |b| {
+            try out.writeByte(if (b >= 0x20 and b < 0x7f) b else '.');
+        }
+        try out.writeAll("|\n");
+    }
+}
+
+fn runExports(
+    io: Io,
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    path: []const u8,
+    json: bool,
+) !void {
+    var mapping = try scribe.mmap.open(io, path);
+    defer mapping.deinit();
+    const bytes = mapping.bytes();
+
+    var info = try scribe.parseFormat(gpa, bytes);
+    defer info.deinit(gpa);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(gpa);
+
+    switch (info) {
+        .elf => |e| try collectElfExports(gpa, &names, e, bytes),
+        .macho => |m| try collectMachoExports(gpa, &names, m, bytes),
+        .pe => |p| try collectPeExports(gpa, &names, p, bytes),
+    }
+
+    if (json) {
+        try out.print("{{\"file\":\"{s}\",\"format\":\"{s}\",\"exports\":[", .{ path, @tagName(info) });
+        for (names.items, 0..) |n, i| {
+            if (i != 0) try out.writeAll(",");
+            try out.print("\"{s}\"", .{n});
+        }
+        try out.writeAll("]}\n");
+        return;
+    }
+    if (names.items.len == 0) {
+        try out.writeAll("(no exports)\n");
+        return;
+    }
+    for (names.items) |n| try out.print("{s}\n", .{n});
+    try out.print("({d} exports)\n", .{names.items.len});
+}
+
+fn collectElfExports(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList([]const u8),
+    info: scribe.ElfInfo,
+    bytes: []const u8,
+) !void {
+    // Walk .dynsym; collect symbols with binding GLOBAL/WEAK and shndx != 0
+    // (= defined in this image, not undefined references).
+    var dynsym_off: u64 = 0;
+    var dynsym_size: u64 = 0;
+    var dynstr_off: u64 = 0;
+    var dynstr_size: u64 = 0;
+    for (info.sections) |s| {
+        if (std.mem.eql(u8, s.name, ".dynsym")) {
+            dynsym_off = s.offset;
+            dynsym_size = s.size;
+        } else if (std.mem.eql(u8, s.name, ".dynstr")) {
+            dynstr_off = s.offset;
+            dynstr_size = s.size;
+        }
+    }
+    if (dynsym_size == 0 or dynstr_size == 0) return;
+    if (dynsym_off + dynsym_size > bytes.len or dynstr_off + dynstr_size > bytes.len) return;
+    const strtab = bytes[@intCast(dynstr_off)..][0..@intCast(dynstr_size)];
+
+    const ent_size: u64 = if (info.is_64) @sizeOf(std.elf.Elf64_Sym) else @sizeOf(std.elf.Elf32_Sym);
+    var off: u64 = dynsym_off;
+    while (off + ent_size <= dynsym_off + dynsym_size) : (off += ent_size) {
+        const slot = bytes[@intCast(off)..][0..@intCast(ent_size)];
+        const st_name: u32 = std.mem.readInt(u32, slot[0..4], info.endian);
+        const st_info_byte: u8 = if (info.is_64) slot[4] else slot[12];
+        const st_shndx: u16 = if (info.is_64) std.mem.readInt(u16, slot[6..8], info.endian)
+            else std.mem.readInt(u16, slot[14..16], info.endian);
+        const bind = st_info_byte >> 4;
+        // STB_GLOBAL=1, STB_WEAK=2; SHN_UNDEF=0 means undefined import.
+        if ((bind != 1 and bind != 2) or st_shndx == 0) continue;
+        if (st_name >= strtab.len) continue;
+        const name = std.mem.sliceTo(strtab[st_name..], 0);
+        if (name.len == 0) continue;
+        try out.append(gpa, name);
+    }
+}
+
+fn collectMachoExports(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList([]const u8),
+    info: scribe.MachoInfo,
+    full_bytes: []const u8,
+) !void {
+    // Walk LC_SYMTAB. Symbols with N_EXT bit set + N_TYPE != N_UNDF are
+    // exports of this image. Names live in the string table at strtab_off.
+    const slice_off: usize = @intCast(info.fat_slice_offset);
+    if (slice_off >= full_bytes.len) return;
+    const bytes = full_bytes[slice_off..];
+
+    const lc_start: usize = if (info.is_64) @sizeOf(std.macho.mach_header_64) else @sizeOf(std.macho.mach_header);
+    if (lc_start > bytes.len) return;
+    const ncmds: u32 = if (info.is_64)
+        (@as(*align(1) const std.macho.mach_header_64, @ptrCast(bytes.ptr))).ncmds
+    else
+        (@as(*align(1) const std.macho.mach_header, @ptrCast(bytes.ptr))).ncmds;
+
+    var off: usize = lc_start;
+    var i: u32 = 0;
+    while (i < ncmds and off + @sizeOf(std.macho.load_command) <= bytes.len) : (i += 1) {
+        const lc: *align(1) const std.macho.load_command = @ptrCast(bytes[off..].ptr);
+        const cmdsize = lc.cmdsize;
+        if (cmdsize < @sizeOf(std.macho.load_command)) break;
+        if (off + cmdsize > bytes.len) break;
+        if (lc.cmd == .SYMTAB) {
+            if (cmdsize >= @sizeOf(std.macho.symtab_command)) {
+                const sc: *align(1) const std.macho.symtab_command = @ptrCast(bytes[off..].ptr);
+                const sym_off: usize = sc.symoff;
+                const nsyms: usize = sc.nsyms;
+                const str_off: usize = sc.stroff;
+                const str_sz: usize = sc.strsize;
+                const ent: usize = if (info.is_64) @sizeOf(std.macho.nlist_64) else @sizeOf(std.macho.nlist);
+                if (str_off + str_sz > bytes.len) return;
+                if (sym_off + nsyms * ent > bytes.len) return;
+                const strtab = bytes[str_off..][0..str_sz];
+                var k: usize = 0;
+                while (k < nsyms) : (k += 1) {
+                    const nl_off = sym_off + k * ent;
+                    const n_strx: u32 = std.mem.readInt(u32, bytes[nl_off..][0..4], .little);
+                    const n_type: u8 = bytes[nl_off + 4];
+                    // N_EXT = 0x01, N_TYPE mask = 0x0E, N_UNDF = 0x0
+                    const n_ext = (n_type & 0x01) != 0;
+                    const ntype = n_type & 0x0E;
+                    if (!n_ext or ntype == 0x0) continue;
+                    if (n_strx >= strtab.len) continue;
+                    const name = std.mem.sliceTo(strtab[n_strx..], 0);
+                    if (name.len == 0) continue;
+                    try out.append(gpa, name);
+                }
+            }
+            return;
+        }
+        off += cmdsize;
+    }
+}
+
+fn collectPeExports(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList([]const u8),
+    info: scribe.PeInfo,
+    bytes: []const u8,
+) !void {
+    // Walk Export Directory (data dir #0). Resolve RVAs via section table.
+    if (bytes.len < 0x40) return;
+    const e_lfanew = std.mem.readInt(u32, bytes[0x3c..][0..4], .little);
+    const sig_off: usize = e_lfanew;
+    if (sig_off + 24 > bytes.len) return;
+    const opt_off = sig_off + 4 + 20; // PE\0\0 + IMAGE_FILE_HEADER
+    const dd_off: usize = opt_off + (if (info.is_64) @as(usize, 0x88) else @as(usize, 0x70));
+    if (dd_off + 8 > bytes.len) return;
+    const exp_rva = std.mem.readInt(u32, bytes[dd_off..][0..4], .little);
+    const exp_size = std.mem.readInt(u32, bytes[dd_off + 4 ..][0..4], .little);
+    if (exp_rva == 0 or exp_size == 0) return;
+    const exp_off = peRvaToFileOffset(info, exp_rva) orelse return;
+    if (exp_off + 40 > bytes.len) return;
+    // IMAGE_EXPORT_DIRECTORY layout:
+    //   0  DWORD Characteristics
+    //   4  DWORD TimeDateStamp
+    //   8  WORD  MajorVersion / WORD MinorVersion
+    //  12  DWORD Name (RVA)
+    //  16  DWORD Base
+    //  20  DWORD NumberOfFunctions
+    //  24  DWORD NumberOfNames
+    //  28  DWORD AddressOfFunctions (RVA)
+    //  32  DWORD AddressOfNames (RVA)
+    //  36  DWORD AddressOfNameOrdinals (RVA)
+    const num_names = std.mem.readInt(u32, bytes[exp_off + 24 ..][0..4], .little);
+    const names_rva = std.mem.readInt(u32, bytes[exp_off + 32 ..][0..4], .little);
+    const names_off = peRvaToFileOffset(info, names_rva) orelse return;
+    if (names_off + num_names * 4 > bytes.len) return;
+    var i: u32 = 0;
+    while (i < num_names) : (i += 1) {
+        const name_rva = std.mem.readInt(u32, bytes[names_off + i * 4 ..][0..4], .little);
+        const name_off = peRvaToFileOffset(info, name_rva) orelse continue;
+        if (name_off >= bytes.len) continue;
+        const name = std.mem.sliceTo(bytes[name_off..], 0);
+        if (name.len == 0) continue;
+        try out.append(gpa, name);
+    }
+}
+
+fn peRvaToFileOffset(info: scribe.PeInfo, rva: u32) ?u64 {
+    for (info.sections) |s| {
+        if (rva >= s.virtual_address and rva < s.virtual_address + s.virtual_size)
+            return @as(u64, s.raw_offset) + (rva - s.virtual_address);
+    }
+    return null;
+}
+
+fn runDiff(
+    io: Io,
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    path_a: []const u8,
+    path_b: []const u8,
+    json: bool,
+    style: scribe.term.Style,
+) !void {
+    var ma = try scribe.mmap.open(io, path_a);
+    defer ma.deinit();
+    var mb = try scribe.mmap.open(io, path_b);
+    defer mb.deinit();
+    var ia = try scribe.parseFormat(gpa, ma.bytes());
+    defer ia.deinit(gpa);
+    var ib = try scribe.parseFormat(gpa, mb.bytes());
+    defer ib.deinit(gpa);
+
+    if (json) {
+        try out.print("{{\"a\":\"{s}\",\"b\":\"{s}\",", .{ path_a, path_b });
+        try out.print("\"format_a\":\"{s}\",\"format_b\":\"{s}\",", .{ @tagName(ia), @tagName(ib) });
+        try out.print("\"arch_a\":\"{s}\",\"arch_b\":\"{s}\"", .{ @tagName(ia.arch()), @tagName(ib.arch()) });
+        try out.writeAll("}\n");
+        return;
+    }
+
+    try out.print("a:        {s}\n", .{path_a});
+    try out.print("b:        {s}\n", .{path_b});
+
+    if (@as(scribe.FormatKind, ia) != @as(scribe.FormatKind, ib)) {
+        try style.bold(out, "format:   ");
+        try out.print("{s} ≠ {s}\n", .{ @tagName(ia), @tagName(ib) });
+    } else {
+        try out.print("format:   {s} (matches)\n", .{@tagName(ia)});
+    }
+    if (ia.arch() != ib.arch()) {
+        try style.bold(out, "arch:     ");
+        try out.print("{s} ≠ {s}\n", .{ @tagName(ia.arch()), @tagName(ib.arch()) });
+    } else {
+        try out.print("arch:     {s} (matches)\n", .{@tagName(ia.arch())});
+    }
+
+    // Section name set diff.
+    const names_a = try sectionNames(gpa, ia);
+    defer gpa.free(names_a);
+    const names_b = try sectionNames(gpa, ib);
+    defer gpa.free(names_b);
+
+    try out.writeAll("sections:\n");
+    var only_a: usize = 0;
+    var only_b: usize = 0;
+    for (names_a) |na| {
+        if (!containsSlice(names_b, na)) {
+            try out.print("  - {s}  (only in A)\n", .{na});
+            only_a += 1;
+        }
+    }
+    for (names_b) |nb| {
+        if (!containsSlice(names_a, nb)) {
+            try out.print("  + {s}  (only in B)\n", .{nb});
+            only_b += 1;
+        }
+    }
+    if (only_a == 0 and only_b == 0) try out.writeAll("  (identical section sets)\n");
+
+    // Hardening diff.
+    var ra = scribe.analyzeHardening(gpa, ia, ma.bytes()) catch null;
+    defer if (ra) |*r| r.deinit(gpa);
+    var rb = scribe.analyzeHardening(gpa, ib, mb.bytes()) catch null;
+    defer if (rb) |*r| r.deinit(gpa);
+
+    if (ra != null and rb != null) {
+        try out.writeAll("hardening:\n");
+        var any = false;
+        for (ra.?.checks) |ca| {
+            for (rb.?.checks) |cb| {
+                if (!std.mem.eql(u8, ca.id, cb.id)) continue;
+                if (ca.status != cb.status) {
+                    try out.print("  {s:<18} {s} → {s}\n", .{ ca.id, ca.status.label(), cb.status.label() });
+                    any = true;
+                }
+            }
+        }
+        if (!any) try out.writeAll("  (identical hardening posture)\n");
+    }
+}
+
+fn sectionNames(gpa: std.mem.Allocator, info: scribe.FormatInfo) ![][]const u8 {
+    return switch (info) {
+        .elf => |e| blk: {
+            const out = try gpa.alloc([]const u8, e.sections.len);
+            for (e.sections, 0..) |s, i| out[i] = s.name;
+            break :blk out;
+        },
+        .macho => |m| blk: {
+            const out = try gpa.alloc([]const u8, m.sections.len);
+            for (m.sections, 0..) |s, i| out[i] = s.name;
+            break :blk out;
+        },
+        .pe => |p| blk: {
+            const out = try gpa.alloc([]const u8, p.sections.len);
+            for (p.sections, 0..) |s, i| out[i] = s.name;
+            break :blk out;
+        },
+    };
+}
+
+fn containsSlice(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |h| if (std.mem.eql(u8, h, needle)) return true;
+    return false;
 }
 
 fn runYara(
@@ -606,12 +1288,22 @@ fn printPeSections(out: *Io.Writer, p: scribe.PeInfo) !void {
     }
 }
 
-fn runDeps(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, path: []const u8) !void {
+fn runDeps(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, path: []const u8, json: bool) !void {
     var mapping = try scribe.mmap.open(io, path);
     defer mapping.deinit();
 
     const list = try scribe.collectDeps(gpa, mapping.bytes());
     defer gpa.free(list);
+
+    if (json) {
+        try out.print("{{\"file\":\"{s}\",\"deps\":[", .{path});
+        for (list, 0..) |d, i| {
+            if (i != 0) try out.writeAll(",");
+            try out.print("{{\"name\":\"{s}\",\"kind\":\"{s}\"}}", .{ d.name, @tagName(d.kind) });
+        }
+        try out.writeAll("]}\n");
+        return;
+    }
 
     if (list.len == 0) {
         try out.writeAll("(no dynamic dependencies)\n");
@@ -620,23 +1312,86 @@ fn runDeps(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, path: []const u8) !v
     for (list) |d| try out.print("  {s:<24} [{s}]\n", .{ d.name, @tagName(d.kind) });
 }
 
-fn runStrings(io: Io, out: *Io.Writer, path: []const u8, min_len: usize) !void {
+fn runStrings(io: Io, out: *Io.Writer, path: []const u8, min_len: usize, json: bool) !void {
     var mapping = try scribe.mmap.open(io, path);
     defer mapping.deinit();
 
     var it = scribe.scanStrings(mapping.bytes(), .{ .min_len = min_len });
+    if (json) {
+        try out.print("{{\"file\":\"{s}\",\"min_len\":{d},\"strings\":[", .{ path, min_len });
+        var first = true;
+        while (it.next()) |s| {
+            if (!first) try out.writeAll(",");
+            first = false;
+            try out.writeByte('"');
+            try writeJsonEscaped(out, s);
+            try out.writeByte('"');
+        }
+        try out.writeAll("]}\n");
+        return;
+    }
     while (it.next()) |s| {
         try out.writeAll(s);
         try out.writeByte('\n');
     }
 }
 
-fn runEntropy(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, path: []const u8) !void {
+fn writeJsonEscaped(out: *Io.Writer, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try out.writeAll("\\\""),
+            '\\' => try out.writeAll("\\\\"),
+            '\n' => try out.writeAll("\\n"),
+            '\r' => try out.writeAll("\\r"),
+            '\t' => try out.writeAll("\\t"),
+            0...0x08, 0x0B, 0x0C, 0x0E...0x1F => try out.print("\\u{x:0>4}", .{c}),
+            else => try out.writeByte(c),
+        }
+    }
+}
+
+fn runEntropy(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, path: []const u8, json: bool) !void {
     var mapping = try scribe.mmap.open(io, path);
     defer mapping.deinit();
     const bytes = mapping.bytes();
 
     const overall = scribe.shannon(bytes);
+    if (json) {
+        try out.print("{{\"file\":\"{s}\",\"overall\":{d:.4},\"sections\":[", .{ path, overall });
+        var first = true;
+        if (scribe.parseFormat(gpa, bytes)) |info_const| {
+            var info = info_const;
+            defer info.deinit(gpa);
+            switch (info) {
+                .elf => |e| for (e.sections) |s| {
+                    if (s.size == 0 or s.offset + s.size > bytes.len) continue;
+                    const sb = bytes[@intCast(s.offset)..][0..@intCast(s.size)];
+                    if (!first) try out.writeAll(",");
+                    first = false;
+                    try out.print("{{\"name\":\"{s}\",\"entropy\":{d:.4}}}", .{ s.name, scribe.shannon(sb) });
+                },
+                .macho => |m| {
+                    const base = m.fat_slice_offset;
+                    for (m.sections) |s| {
+                        if (s.size == 0 or base + s.offset + s.size > bytes.len) continue;
+                        const sb = bytes[@intCast(base + s.offset)..][0..@intCast(s.size)];
+                        if (!first) try out.writeAll(",");
+                        first = false;
+                        try out.print("{{\"seg\":\"{s}\",\"name\":\"{s}\",\"entropy\":{d:.4}}}", .{ s.seg, s.name, scribe.shannon(sb) });
+                    }
+                },
+                .pe => |p| for (p.sections) |s| {
+                    if (s.raw_size == 0 or s.raw_offset + s.raw_size > bytes.len) continue;
+                    const sb = bytes[s.raw_offset..][0..s.raw_size];
+                    if (!first) try out.writeAll(",");
+                    first = false;
+                    try out.print("{{\"name\":\"{s}\",\"entropy\":{d:.4}}}", .{ s.name, scribe.shannon(sb) });
+                },
+            }
+        } else |_| {}
+        try out.writeAll("]}\n");
+        return;
+    }
     try out.print("overall: {d:.4} bits/byte\n", .{overall});
 
     var info = scribe.parseFormat(gpa, bytes) catch |e| {

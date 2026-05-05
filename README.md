@@ -13,6 +13,9 @@ Scribe is a high-performance, cross-platform binary forensics library and CLI wr
   - [`scribe info`](#scribe-info-path) — format, arch, sections, hardening
   - [`scribe harden`](#scribe-harden-path) — exploit-mitigation report
   - [`scribe yara`](#scribe-yara-path---rules-p) — YARA-subset rule matcher
+  - [`scribe hex`](#scribe-hex-path-opts) — hex + ASCII dump
+  - [`scribe exports`](#scribe-exports-path) — dynamically-exported symbols
+  - [`scribe diff`](#scribe-diff-a-b) — structural diff of two binaries
   - [`scribe deps`](#scribe-deps-path) — dynamic dependencies
   - [`scribe strings`](#scribe-strings-path-min) — printable runs (SIMD)
   - [`scribe entropy`](#scribe-entropy-path) — Shannon entropy per section
@@ -60,7 +63,7 @@ Scribe is a high-performance, cross-platform binary forensics library and CLI wr
 | 8d     | Anti-tampering anomalies (auto-run in `scan`) — entry-outside-text, non-canonical interpreter / dylinker, process-injection symbol cluster | done |
 | 8+     | Full disassembler-driven CFG, PE PDB parser, capability/syscall scan, code-signature CMS + entitlements parser | open |
 
-Tests: 156 unit + integration tests (`zig build test`).
+Tests: 164 unit + integration tests (`zig build test`). Allocator-leak-clean.
 
 ---
 
@@ -238,6 +241,47 @@ flow through `scribe policy` and the TUI.
 target (no flag needed): non-canonical ELF interpreter / Mach-O
 dylinker, entry point outside any `+X` section, process-injection
 symbol clusters. Findings appear under `BIN-ANOM-*` rule IDs.
+
+### `scribe hex <path> [opts]`
+
+Hex + ASCII dump. `--offset 0x...` (hex or decimal) sets the start
+position; `--length N` caps the output (default 256 bytes); `--section
+<name>` jumps to a parsed section start (offset + length default to that
+section's location and size, capped at 4 KiB).
+
+```sh
+$ scribe hex /bin/zsh --section __text --length 64
+000a4788  8c bf 00 14 7f 23 03 d5  fd 7b bf a9 fd 03 00 91  |.....#...{......|
+000a4798  e1 03 00 b0 21 40 30 91  a0 0a 80 52 02 00 80 d2  |....!@0....R....|
+```
+
+Section names use the parsed-format convention — for Mach-O accept
+either bare (`__text`) or composite (`__TEXT/__text`); ELF / PE accept
+the section's exact name.
+
+### `scribe exports <path>`
+
+Lists dynamically-exported symbols.
+
+| Format | Source                                                   |
+| ------ | -------------------------------------------------------- |
+| ELF    | `.dynsym` filtered to `STB_GLOBAL` / `STB_WEAK` + defined |
+| Mach-O | `LC_SYMTAB` filtered to `N_EXT` + non-undefined          |
+| PE     | Export Directory `AddressOfNames`                        |
+
+`--json` emits `{"file":"...","format":"...","exports":[...]}`.
+
+### `scribe diff <a> <b>`
+
+Structural diff of two binaries. Reports:
+
+- format mismatch
+- arch mismatch
+- section set delta (only-in-A / only-in-B)
+- hardening posture changes (PIE enabled → disabled, etc.)
+
+Useful for triaging supply-chain swaps and checking compiler-flag drift
+across releases. `--json` emits a structured comparison.
 
 ### `scribe deps <path>`
 
@@ -445,9 +489,9 @@ Keys:
 | Key                  | Action                                                          |
 | -------------------- | --------------------------------------------------------------- |
 | `j` `k` `↑` `↓` `n` `p` | Navigate the list (mouse-wheel scroll also works)            |
-| `1` `2` `3` `4` `5`  | Filter to All / Components / Secrets / Vulns / Config           |
+| `1` `2` `3` `4` `5` `6`  | Filter to All / Components / Secrets / Vulns / Config / Hardening |
 | `Tab` / `Shift-Tab`  | Cycle filter forward / backward                                 |
-| `/`                  | Enter search mode (case-insensitive substring against titles)   |
+| `/`                  | Enter search mode (case-insensitive substring; matches title + detail) |
 | `Enter`              | (in search) Confirm query and resume normal nav                 |
 | `Esc`                | (in search) Cancel and clear the query                          |
 | `Space`              | Toggle multi-select on the current row (auto-advances cursor)   |
@@ -455,6 +499,7 @@ Keys:
 | `b`                  | Toggle bookmark — applies to all selected when set, else cursor |
 | `e`                  | Export bookmarks to `.scribe-bookmarks.md` (writes a diff block against the previous export when one exists) |
 | `y`                  | Yank current item's detail text to system clipboard (OSC 52)    |
+| `?`                  | Toggle help overlay (renders key map in detail pane)            |
 | `q` / `Esc` / `^C`   | Quit                                                            |
 
 Visual cues:

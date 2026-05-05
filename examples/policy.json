@@ -1,0 +1,22 @@
+{
+  "fail_on": {
+    "vulnerability_severity_at_or_above": "high",
+    "secret_kinds": [
+      "aws_access_key",
+      "aws_secret_key",
+      "gcp_service_account",
+      "pem_private_key",
+      "github_pat",
+      "slack_token"
+    ],
+    "config_severity_at_or_above": "medium"
+  },
+  "ignore": {
+    "vulnerability_ids": [
+      "CVE-1990-0000"
+    ],
+    "rule_ids": [
+      "DKR003"
+    ]
+  }
+}

@@ -155,8 +155,11 @@ const TabBar = struct {
 
     fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
         const self: *TabBar = @ptrCast(@alignCast(ptr));
-        const max = ctx.max.size();
-        const size: vxfw.Size = .{ .width = max.width, .height = 1 };
+        // FlexColumn's first pass asks for our inherent height with a null
+        // max.height, so don't call ctx.max.size() — read width directly
+        // and let our height be the intrinsic 1 row.
+        const max_w = ctx.max.width orelse 0;
+        const size: vxfw.Size = .{ .width = max_w, .height = 1 };
         const surface = try vxfw.Surface.init(ctx.arena, self.widget(), size);
         @memset(surface.buffer, .{ .style = .{} });
 
@@ -246,8 +249,10 @@ const StatusBar = struct {
 
     fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
         const self: *StatusBar = @ptrCast(@alignCast(ptr));
-        const max = ctx.max.size();
-        const size: vxfw.Size = .{ .width = max.width, .height = 1 };
+        // Same caveat as TabBar — FlexColumn's first-pass passes
+        // max.height = null. We're a 1-row strip, so width is enough.
+        const max_w = ctx.max.width orelse 0;
+        const size: vxfw.Size = .{ .width = max_w, .height = 1 };
         const surface = try vxfw.Surface.init(ctx.arena, self.widget(), size);
         @memset(surface.buffer, .{ .style = .{} });
 
@@ -342,6 +347,8 @@ const Root = struct {
     status_buf: [256]u8 = undefined,
     status_len: usize = 0,
 
+    show_help: bool = false,
+
     /// Allocator we use to write export files etc.
     gpa: Allocator,
     /// Path the user pointed scribe at — embedded in export header.
@@ -374,6 +381,11 @@ const Root = struct {
                     return;
                 }
                 if (key.matches('/', .{})) return self.enterSearch(ctx);
+                if (key.matches('?', .{})) {
+                    self.show_help = !self.show_help;
+                    ctx.consumeAndRedraw();
+                    return;
+                }
                 if (key.matches(' ', .{})) return self.toggleSelection(ctx);
                 if (key.matches('c', .{})) return self.clearSelection(ctx);
                 if (key.matches('b', .{})) return self.toggleBookmark(ctx);
@@ -640,7 +652,7 @@ const Root = struct {
         var n: usize = 0;
         for (self.items, 0..) |*it, i| {
             if (!self.filter.includes(it.category)) continue;
-            if (query.len > 0 and !matchQuery(it.title_plain, query) and it.category != .summary) continue;
+            if (query.len > 0 and !itemMatchesQuery(it, query) and it.category != .summary) continue;
             // Refresh title + style (prefix and bg follow bookmark/selection).
             self.list_text_buf[i].text = it.currentTitle();
             self.list_text_buf[i].style = it.currentStyle();
@@ -662,8 +674,12 @@ const Root = struct {
 
     fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
         const self: *Root = @ptrCast(@alignCast(ptr));
-        // Refresh detail text from current cursor before drawing.
-        if (self.currentItem()) |it| {
+        // Refresh detail text from current cursor before drawing. When the
+        // user hit `?`, swap in the help-page segments instead so the right
+        // pane becomes a self-documenting key map.
+        if (self.show_help) {
+            self.detail.text = help_detail[0..];
+        } else if (self.currentItem()) |it| {
             self.detail.text = it.detail;
         } else {
             self.detail.text = empty_detail[0..];
@@ -730,8 +746,39 @@ fn matchQuery(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+/// Search title first (cheap), then walk detail segments. Returns on first
+/// hit so worst case is bounded by the longest detail block.
+fn itemMatchesQuery(it: *const Item, needle: []const u8) bool {
+    if (matchQuery(it.title_plain, needle)) return true;
+    for (it.detail) |seg| {
+        if (matchQuery(seg.text, needle)) return true;
+    }
+    return false;
+}
+
 const empty_detail = [_]Segment{
     .{ .text = "(no items)", .style = .{ .fg = palette.dim, .italic = true } },
+};
+
+const help_detail = [_]Segment{
+    .{ .text = "scribe ui — keys\n\n", .style = .{ .bold = true, .fg = palette.heading } },
+    .{ .text = "Navigation\n", .style = .{ .bold = true, .fg = palette.accent } },
+    .{ .text = "  j k ↑ ↓ n p   move cursor (mouse-wheel scroll also works)\n", .style = .{} },
+    .{ .text = "  Tab / S-Tab   cycle filters forward / backward\n", .style = .{} },
+    .{ .text = "  1 2 3 4 5 6   filter All / Components / Secrets / Vulns / Config / Hardening\n\n", .style = .{} },
+    .{ .text = "Search\n", .style = .{ .bold = true, .fg = palette.accent } },
+    .{ .text = "  /             enter search (case-insensitive substring; matches title + detail)\n", .style = .{} },
+    .{ .text = "  Enter         (search) confirm and resume nav\n", .style = .{} },
+    .{ .text = "  Esc           (search) cancel and clear\n\n", .style = .{} },
+    .{ .text = "Triage\n", .style = .{ .bold = true, .fg = palette.accent } },
+    .{ .text = "  Space         toggle multi-select on cursor row (auto-advances)\n", .style = .{} },
+    .{ .text = "  c             clear all multi-selections\n", .style = .{} },
+    .{ .text = "  b             toggle bookmark (selected rows when any selected, else cursor)\n", .style = .{} },
+    .{ .text = "  e             export bookmarks → .scribe-bookmarks.md (diffs vs prior export)\n", .style = .{} },
+    .{ .text = "  y             yank detail to system clipboard (OSC 52)\n\n", .style = .{} },
+    .{ .text = "Misc\n", .style = .{ .bold = true, .fg = palette.accent } },
+    .{ .text = "  ?             toggle this help\n", .style = .{} },
+    .{ .text = "  q / Esc / ^C  quit\n", .style = .{} },
 };
 
 // ---- public entry ----------------------------------------------------------

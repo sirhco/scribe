@@ -838,6 +838,51 @@ at severity `medium`. Hits are listed in the `snippet` field as
 full per-string offset breakdown; `scribe scan --yara <p>` is the
 batched form that joins matches with the rest of the SBOM.
 
+#### Supported syntax
+
+```yara
+rule NAME [: tag1 tag2 ...] {
+  meta:
+    description = "..."         // optional, parsed and ignored
+    severity    = "high"        // optional
+  strings:
+    $a = "literal"   [ascii] [wide] [nocase] [fullword]
+    $b = { AA BB ?? CC }
+  condition:
+    $a or ($b and not $a) or 2 of them or any of them or all of them
+}
+```
+
+- Comments: `// line`, `/* block */`
+- String escapes: `\n` `\r` `\t` `\"` `\\` `\xNN`
+- Conditions: `$id`, `any of them`, `all of them`, `N of them`,
+  `and`, `or`, `not`, `( ... )`, `true`, `false`
+
+#### Unsupported (returns `error.NotImplemented` at parse time)
+
+- Jump ranges: `{ AA [2-5] BB }`
+- Hex alternates: `{ AA (BB | CC) DD }`
+- Regex strings: `$a = /pattern/`
+- `for any/all of` quantifier loops
+- `at <offset>`, `in (a..b)`, `filesize`, `entrypoint`
+- `import "module"` (PE module, ELF module, …)
+- `$*` / `$prefix*` set references
+- `defined()`, `iequals`, `icontains`, `startswith`, `endswith`
+
+If you need full YARA semantics, run upstream YARA and ingest its JSON
+output as a separate finding stream — scribe deliberately keeps the
+engine small and dependency-free.
+
+#### Example rule packs
+
+`examples/yara/suspicious_imports.yar` and
+`examples/yara/secrets_anchor.yar` ship in the repo. Run them with:
+
+```bash
+scribe yara /usr/bin/some_binary --rules examples/yara/suspicious_imports.yar
+scribe scan ./suspect.tar --yara examples/yara/secrets_anchor.yar --plain
+```
+
 ---
 
 ## Secret Pattern Catalog
