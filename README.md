@@ -15,7 +15,10 @@ Scribe is a high-performance, cross-platform binary forensics library and CLI wr
   - [`scribe yara`](#scribe-yara-path---rules-p) — YARA-subset rule matcher
   - [`scribe hex`](#scribe-hex-path-opts) — hex + ASCII dump
   - [`scribe exports`](#scribe-exports-path) — dynamically-exported symbols
+  - [`scribe imports`](#scribe-imports-path) — dynamically-imported symbols
   - [`scribe diff`](#scribe-diff-a-b) — structural diff of two binaries
+  - [`scribe wasm`](#scribe-wasm-path) — list WebAssembly module sections
+  - [`scribe ar list`](#scribe-ar-list-path) — list static archive members
   - [`scribe deps`](#scribe-deps-path) — dynamic dependencies
   - [`scribe strings`](#scribe-strings-path-min) — printable runs (SIMD)
   - [`scribe entropy`](#scribe-entropy-path) — Shannon entropy per section
@@ -142,9 +145,23 @@ All subcommands accept a single positional argument: a local file path. The
 `sbom` subcommand additionally accepts `docker://` and `registry://` URIs
 (described below). Errors go to stderr; structured output goes to stdout.
 
-### `scribe info <path>`
+### Global options
 
-Prints format, architecture, entry point, 64-bit flag, and the section table.
+| Option                  | Effect                                                    |
+| ----------------------- | --------------------------------------------------------- |
+| `--version` / `-V`      | Print scribe version and exit.                            |
+| `--help` / `-h`         | Print usage and exit.                                     |
+| `--quiet` / `-q`        | Suppress the inline progress reporter.                    |
+| `--no-color`            | Force-disable ANSI styling (mirror of `NO_COLOR=1`).      |
+| `completion bash|zsh|fish` | Emit a static shell-completion script.                |
+
+These flags are positional-independent — `scribe --no-color info /bin/ls`
+and `scribe info /bin/ls --no-color` both work.
+
+### `scribe info <path> [opts]`
+
+Prints format, architecture, entry point, 64-bit flag, and the section
+table. Each section row carries a `r-x` style permission triplet.
 
 ```sh
 $ scribe info src/testdata/hello_x86_64
@@ -154,9 +171,19 @@ arch:     x86_64
 entry:    0x1008180
 64-bit:   true
 sections: 12
-  [  1] .rodata                  type=0x0001 addr=0x0000000001000240 size=0x37d0
-  [  4] .text                    type=0x0001 addr=0x0000000001008180 size=0x14189
+  [  1] .rodata                  type=0x0001 addr=0x0000000001000240 size=0x37d0    r--
+  [  4] .text                    type=0x0001 addr=0x0000000001008180 size=0x14189   r-x
   ...
+```
+
+`--json` emits a structured representation (sections + arch + hardening summary).
+`--all-slices` (Mach-O FAT inputs) dumps every slice's arch / file offset / entry / section count.
+`--hashes` adds a per-section short SHA-256 (first 8 bytes hex) so you can
+spot tampering between two builds you can't otherwise diff:
+
+```sh
+$ scribe info ./myapp --hashes | head
+  [  0] .text   ... r-x  sha=45dbc9322fdaf1af
 ```
 
 For Mach-O, sections are printed as `<segment>/<section>` (e.g. `__TEXT/__text`).
@@ -282,6 +309,53 @@ Structural diff of two binaries. Reports:
 
 Useful for triaging supply-chain swaps and checking compiler-flag drift
 across releases. `--json` emits a structured comparison.
+
+### `scribe imports <path>`
+
+Lists dynamically-imported symbols (the symbols this binary expects another
+library to provide).
+
+| Format | Source                                                   |
+| ------ | -------------------------------------------------------- |
+| ELF    | `.dynsym` filtered to `STB_GLOBAL`/`STB_WEAK` + `SHN_UNDEF` |
+| Mach-O | `LC_SYMTAB` filtered to `N_EXT` + `N_TYPE == N_UNDF`     |
+| PE     | Imported library names (Mach-O / ELF have full per-symbol detail; PE listing is library-level) |
+
+`--json` emits `{"file":"...","format":"...","imports":[...]}`.
+
+### `scribe wasm <path>`
+
+WebAssembly module overview. Detects the `\0asm` magic, prints the
+binary-format version, and walks each section (id + payload offset +
+size; for custom sections the leading name is decoded).
+
+```sh
+$ scribe wasm app.wasm
+file:    app.wasm
+format:  wasm
+version: 1
+sections: 11
+  [  0] type         offset=0x0000000a size=42
+  [  1] import       offset=0x00000038 size=120
+  ...
+```
+
+`--json` available.
+
+### `scribe ar list <path>`
+
+Lists members of a static archive (`.a` / `.lib`). Handles SysV `//`
+long-name table and BSD `#1/<N>` long-name extension. Output is
+filename + file offset + member size; `--json` emits the same as JSON.
+
+```sh
+$ scribe ar list /opt/homebrew/lib/libjq.a
+file:    /opt/homebrew/lib/libjq.a
+members: 22
+  __.SYMDEF SORTED            offset=0x00000058  size=9464
+  builtin.o                   offset=0x000025a0  size=95424
+  ...
+```
 
 ### `scribe deps <path>`
 
@@ -489,8 +563,9 @@ Keys:
 | Key                  | Action                                                          |
 | -------------------- | --------------------------------------------------------------- |
 | `j` `k` `↑` `↓` `n` `p` | Navigate the list (mouse-wheel scroll also works)            |
+| `J` `K` / `PgDn` `PgUp` | Page navigation — jump 10 rows at a time                     |
 | `1` `2` `3` `4` `5` `6`  | Filter to All / Components / Secrets / Vulns / Config / Hardening |
-| `Tab` / `Shift-Tab`  | Cycle filter forward / backward                                 |
+| `Tab` / `Shift-Tab`  | Cycle filter forward / backward (now correctly cycles through 6) |
 | `/`                  | Enter search mode (case-insensitive substring; matches title + detail) |
 | `Enter`              | (in search) Confirm query and resume normal nav                 |
 | `Esc`                | (in search) Cancel and clear the query                          |
@@ -551,6 +626,27 @@ All security signals merge into a single CycloneDX 1.5 SBOM with
 `registry://`, `docker://`) auto-discover embedded Dockerfiles / YAMLs
 and audit the OCI image config blob.
 
+#### CI-friendly output formats
+
+`scribe scan` accepts three alternate output flags geared at automation:
+
+| Flag                      | Format                                        | Use case                                  |
+| ------------------------- | --------------------------------------------- | ----------------------------------------- |
+| `--plain`                 | Human-readable plain text (sections + summary) | Local triage                              |
+| `--sarif`                 | SARIF 2.1.0 JSON                              | GitHub code-scanning upload, IDE plugins  |
+| `--github-annotations` (`--gha`) | GitHub Actions workflow commands       | Inline PR-comment annotations             |
+
+```sh
+# Upload SARIF to GitHub code-scanning
+scribe scan ./build/app --sarif --db osv.scvd > scribe.sarif
+# - uses: github/codeql-action/upload-sarif@v3 with sarif_file: scribe.sarif
+
+# Drop inline annotations directly into a PR's Files Changed view
+scribe scan ./build/app --gha --db osv.scvd
+```
+
+Default output (no flag) is CycloneDX 1.5 JSON.
+
 #### Populating the advisory DB
 
 scribe ships with no built-in advisory data. Pull from OSV.dev's
@@ -594,15 +690,21 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    // Mmap-open any binary or container source.
-    var mapping = try scribe.mmap.open(io, "/usr/bin/python3");
-    defer mapping.deinit();
+    // Convenience: mmap + parse in one call. `parsed.deinit` frees both.
+    var parsed = try scribe.parseFromFile(gpa, io, "/usr/bin/python3");
+    defer parsed.deinit(gpa);
 
-    // Auto-detect format and parse.
-    var info = try scribe.parseFormat(gpa, mapping.bytes());
-    defer info.deinit(gpa);
+    std.log.info("arch={s} entry=0x{x}", .{
+        @tagName(parsed.info.arch()),
+        parsed.info.entry(),
+    });
 
-    std.log.info("arch={s} entry=0x{x}", .{ @tagName(info.arch()), info.entry() });
+    // Or do it yourself if you need the mmap separately:
+    //   var mapping = try scribe.mmap.open(io, path);  defer mapping.deinit();
+    //   var info = try scribe.parseFormat(gpa, mapping.bytes());
+    //   defer info.deinit(gpa);
+    const mapping = parsed.mapping;
+    var info = parsed.info;
 
     // SBOM the same bytes.
     var bom = try scribe.sbom.collect(gpa, mapping.bytes());
@@ -621,9 +723,12 @@ Module surface:
 | ------------------- | -------------------------------------------------------------- |
 | `scribe.mmap`       | RAII mmap wrapper over `Io.File.MemoryMap`                     |
 | `scribe.elf`        | ELF32/64 zero-copy parser (`parse`, `ElfInfo`, `SectionHeader`) |
-| `scribe.macho`      | Mach-O 64-bit parser, sections + dylibs                        |
+| `scribe.macho`      | Mach-O 32/64 + FAT/Universal parser; sections, dylibs, header flags, fat_slice_arch |
 | `scribe.pe`         | PE/COFF parser via `std.coff.Coff`                             |
+| `scribe.wasm`       | WebAssembly module walker (magic + sections, custom-section names) |
+| `scribe.ar`         | AR archive walker (SysV `//` long names + BSD `#1/<N>`)        |
 | `scribe.format`     | Unified `Info` union + `detect`/`parse`                        |
+| `scribe.parseFromFile(allocator, io, path)` | mmap + parse convenience; returns `Parsed` with bundled `deinit` |
 | `scribe.strings`    | SIMD printable-ASCII iterator                                  |
 | `scribe.entropy`    | Shannon entropy (`shannon([]const u8) -> f64`)                 |
 | `scribe.deps`       | Unified dynamic dependency extractor                           |
@@ -638,6 +743,9 @@ Module surface:
 | `scribe.security.vulnerability` | Advisory matcher (OSV-lite, OSV native, SCVD binary) |
 | `scribe.security.config`      | IaC audit (Dockerfile, Kubernetes, OCI image-config) |
 | `scribe.security.policy`      | JSON-driven gatekeeper over a populated `Sbom`       |
+| `scribe.security.hardening`   | Cross-format exploit-mitigation analyzer + `toConfigIssues` |
+| `scribe.security.anomalies`   | Anti-tampering structural checks (entry-outside-text, interp/dylinker, overlap, injection symbols) |
+| `scribe.security.yara`        | YARA-subset rule engine (parse, scan)                |
 | `scribe.yaml`                 | YAML 1.2 subset parser (multi-doc, anchors/aliases, merge keys, YAML 1.1 booleans, block + flow, Helm tolerated) — backs the Kubernetes audit |
 | `scribe.term`                 | TTY-aware ANSI styling (`Style.auto`, `severityCode`, `writeCount`)              |
 | `scribe.progress`             | Inline ANSI-spinner progress reporter (`Reporter.init`, `start`, `step`, `stepf`, `finish`, `fail`); no-op when stderr isn't a TTY |

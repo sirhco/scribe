@@ -42,6 +42,8 @@ tar, registry pull, local-docker pull).
   - [OSV.dev native JSON](#osvdev-native-json)
   - [Policy JSON](#policy-json)
   - [CycloneDX output extensions](#cyclonedx-output-extensions)
+  - [SARIF 2.1.0 output](#sarif-output)
+  - [GitHub Annotations output](#github-annotations-output)
 - [Rule Catalog](#rule-catalog)
   - [Dockerfile (`DKR###`)](#dockerfile-rules-dkr)
   - [Kubernetes (`K8S###`)](#kubernetes-rules-k8s)
@@ -727,6 +729,55 @@ Property name conventions:
 - `scribe:config:<source>:<rule_id>` — IaC misconfigurations
   (source ∈ `dockerfile`, `kubernetes`, `image_config`)
 
+### SARIF output
+
+`scribe scan --sarif` emits SARIF 2.1.0. Single run, single tool driver
+(`scribe`). One `result` per finding (secret / vulnerability / config
+issue / hardening flag / anomaly / YARA match). Stable rule IDs are
+preserved as the SARIF `ruleId`. Severity → SARIF `level`:
+
+| Severity        | SARIF level |
+| --------------- | ----------- |
+| `critical`      | `error`     |
+| `high`          | `error`     |
+| `medium`        | `warning`   |
+| `low` / `info`  | `note`      |
+
+Each result includes a `physicalLocation` pointing at the target file;
+secret findings carry a `region.byteOffset` for direct triage. Drop the
+JSON straight into `github/codeql-action/upload-sarif@v3` or any SARIF
+viewer:
+
+```yaml
+- run: scribe scan ./build/app --sarif --db osv.scvd > scribe.sarif
+- uses: github/codeql-action/upload-sarif@v3
+  with: { sarif_file: scribe.sarif }
+```
+
+### GitHub Annotations output
+
+`scribe scan --github-annotations` (alias `--gha`) emits GitHub Actions
+workflow commands, one per line:
+
+```
+::error file=path,line=N,title=RULE_ID::message
+::warning ...
+::notice ...
+```
+
+Severity mapping:
+
+| Severity        | Workflow command |
+| --------------- | ---------------- |
+| `critical` / `high` | `::error`    |
+| `medium`        | `::warning`      |
+| `low` / `info`  | `::notice`       |
+
+When run inside a GitHub Actions step, these surface as inline
+annotations in the **Files Changed** view of the triggering PR — no SARIF
+upload required. Use this for fast feedback; use `--sarif` for the full
+historical security tab.
+
 ---
 
 ## Rule Catalog
@@ -809,6 +860,8 @@ Rule IDs are `BIN-<format>-<check>`. `<format>` is `ELF`, `MAC`, or `PE`.
 | BIN-MAC-ENCRYPTED     | Mach-O | info                | `LC_ENCRYPTION_INFO[_64]` `cryptid != 0`             |
 | BIN-MAC-RPATH         | Mach-O | info                | `LC_RPATH` present                                   |
 | BIN-MAC-CANARY        | Mach-O | low                 | Stack canary (`_stack_chk_fail` symbol)              |
+| BIN-MAC-CS_IDENT      | Mach-O | n/a (info)          | CodeDirectory `identifier` string (e.g. `com.apple.zsh`) |
+| BIN-MAC-CS_TEAM       | Mach-O | n/a (info)          | CodeDirectory `teamID` string (CD version ≥ 0x20200) |
 | BIN-PE-ASLR           | PE     | medium              | `IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE`              |
 | BIN-PE-HIGH_ENTROPY_VA| PE     | low                 | 64-bit high-entropy ASLR                             |
 | BIN-PE-DEP            | PE     | medium              | `NX_COMPAT` flag                                     |
@@ -829,6 +882,7 @@ warrant manual triage.
 | BIN-ANOM-INTERP_NONCANONICAL | ELF    | low      | Non-canonical ELF interpreter (`PT_INTERP`)      |
 | BIN-ANOM-DYLINKER_NONCANONICAL | Mach-O | low   | Dynamic linker not `/usr/lib/dyld`               |
 | BIN-ANOM-INJECTION_SYMS  | Mach-O    | medium   | ≥2 process-injection symbols imported            |
+| BIN-ANOM-OVERLAP_SECTIONS | ELF / Mach-O | high  | Section file ranges overlap (packer/anti-disasm marker) |
 
 ### YARA rules (`YARA-`)
 
