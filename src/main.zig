@@ -10,6 +10,7 @@ const usage =
     \\Usage:
     \\  scribe info <path>             format, arch, entry, sections, hardening
     \\  scribe harden <path> [--json]  exploit-mitigation report (PIE/NX/RELRO/CFG/...)
+    \\  scribe yara <path> --rules <p> match a YARA-subset rule file ([--json])
     \\  scribe deps <path>             dynamic library dependencies
     \\  scribe strings <path> [min]    printable ASCII runs (default min=4)
     \\  scribe entropy <path>          Shannon entropy per section
@@ -75,6 +76,27 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, a, "--json")) json = true;
         }
         runHarden(io, gpa, stdout, args[2], json, style) catch |err| return dieErr(stderr, err);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "yara")) {
+        if (args.len < 3) return die(stderr, "error: 'yara' requires a path\n", 1);
+        var json = false;
+        var rules_path: ?[]const u8 = null;
+        var idx: usize = 3;
+        while (idx < args.len) : (idx += 1) {
+            const a = args[idx];
+            if (std.mem.eql(u8, a, "--json")) {
+                json = true;
+            } else if (std.mem.eql(u8, a, "--rules")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --rules requires a path\n", 1);
+                idx += 1;
+                rules_path = args[idx];
+            } else {
+                return die(stderr, "error: unknown 'yara' option\n", 1);
+            }
+        }
+        const rp = rules_path orelse return die(stderr, "error: 'yara' requires --rules <path>\n", 1);
+        runYara(io, gpa, stdout, args[2], rp, json, style) catch |err| return dieErr(stderr, err);
         return;
     }
     if (std.mem.eql(u8, cmd, "deps")) {
@@ -214,6 +236,7 @@ pub fn main(init: std.process.Init) !void {
         var db_path: ?[]const u8 = null;
         var config_path: ?[]const u8 = null;
         var fp_db_path: ?[]const u8 = null;
+        var yara_path: ?[]const u8 = null;
         var sec_opts: scribe.security.secrets.ScanOptions = .{};
         var idx: usize = 3;
         while (idx < args.len) : (idx += 1) {
@@ -241,11 +264,15 @@ pub fn main(init: std.process.Init) !void {
                 if (idx + 1 >= args.len) return die(stderr, "error: --fp-db requires a path\n", 1);
                 idx += 1;
                 fp_db_path = args[idx];
+            } else if (std.mem.eql(u8, a, "--yara")) {
+                if (idx + 1 >= args.len) return die(stderr, "error: --yara requires a path\n", 1);
+                idx += 1;
+                yara_path = args[idx];
             } else {
                 return die(stderr, "error: unknown 'scan' option\n", 1);
             }
         }
-        runScan(io, gpa, stdout, args[2], db_path, config_path, fp_db_path, sec_opts, plain, style, &prog) catch |err| {
+        runScan(io, gpa, stdout, args[2], db_path, config_path, fp_db_path, yara_path, sec_opts, plain, style, &prog) catch |err| {
             prog.fail(@errorName(err));
             return dieErr(stderr, err);
         };
@@ -425,6 +452,64 @@ fn runInfo(
     };
     defer report.deinit(gpa);
     try printHardening(out, report, style);
+}
+
+fn runYara(
+    io: Io,
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    target_path: []const u8,
+    rules_path: []const u8,
+    json: bool,
+    style: scribe.term.Style,
+) !void {
+    var rules_map = try scribe.mmap.open(io, rules_path);
+    defer rules_map.deinit();
+    var rules = try scribe.security.yara.parse(gpa, rules_map.bytes());
+    defer rules.deinit(gpa);
+
+    var target = try scribe.mmap.open(io, target_path);
+    defer target.deinit();
+    const matches = try scribe.security.yara.scan(gpa, rules, target.bytes());
+    defer scribe.security.yara.freeMatches(gpa, matches);
+
+    if (json) {
+        try out.print("{{\"file\":\"{s}\",\"matches\":[", .{target_path});
+        for (matches, 0..) |m, i| {
+            if (i != 0) try out.writeAll(",");
+            try out.print("{{\"rule\":\"{s}\",\"hits\":[", .{m.rule});
+            for (m.hits, 0..) |h, j| {
+                if (j != 0) try out.writeAll(",");
+                try out.print("{{\"name\":\"{s}\",\"offset\":{d}}}", .{ h.name, h.offset });
+            }
+            try out.writeAll("]}");
+        }
+        try out.writeAll("]}\n");
+        return;
+    }
+
+    if (matches.len == 0) {
+        try style.dim(out, "(no rules matched)");
+        try out.writeByte('\n');
+        return;
+    }
+    for (matches) |m| {
+        try style.bold(out, m.rule);
+        try out.writeAll("  ");
+        try out.print("{d} hit(s)", .{m.hits.len});
+        if (m.tags.len > 0) {
+            try out.writeAll("  [");
+            for (m.tags, 0..) |t, i| {
+                if (i != 0) try out.writeAll(",");
+                try out.writeAll(t);
+            }
+            try out.writeAll("]");
+        }
+        try out.writeByte('\n');
+        for (m.hits) |h| {
+            try out.print("    ${s} @ 0x{x}\n", .{ h.name, h.offset });
+        }
+    }
 }
 
 fn runHarden(
@@ -1083,6 +1168,7 @@ fn runScan(
     db_path: ?[]const u8,
     config_path: ?[]const u8,
     fp_db_path: ?[]const u8,
+    yara_path: ?[]const u8,
     sec_opts: scribe.security.secrets.ScanOptions,
     plain: bool,
     style: scribe.term.Style,
@@ -1128,9 +1214,57 @@ fn runScan(
         try augmentBomWithFingerprint(io, gpa, bytes, fp, &bom);
     }
 
-    // Hardening pass — only meaningful on a single binary target. Container
-    // sources iterate per-bundled-binary themselves; skip for now to avoid
-    // duplicating image_config issues.
+    // YARA pass — optional. Folds matches into config_issues with severity
+    // info (rule had no `meta: severity = "..."` field surfaced yet). Each
+    // rule that fires becomes one issue.
+    if (yara_path) |yp| {
+        prog.step("running yara rules");
+        var rules_map = try scribe.mmap.open(io, yp);
+        defer rules_map.deinit();
+        var rules = try scribe.security.yara.parse(gpa, rules_map.bytes());
+        defer rules.deinit(gpa);
+        const matches = try scribe.security.yara.scan(gpa, rules, bytes);
+        defer scribe.security.yara.freeMatches(gpa, matches);
+
+        if (matches.len > 0) {
+            const yara_issues = try gpa.alloc(scribe.security.config.Issue, matches.len);
+            errdefer gpa.free(yara_issues);
+            for (matches, 0..) |m, i| {
+                const rule_id = std.fmt.allocPrint(gpa, "YARA-{s}", .{m.rule}) catch return error.OutOfMemory;
+                errdefer gpa.free(rule_id);
+                const title = std.fmt.allocPrint(gpa, "YARA rule matched: {s} ({d} hits)", .{ m.rule, m.hits.len }) catch return error.OutOfMemory;
+                errdefer gpa.free(title);
+                const file_copy = gpa.dupe(u8, target_path) catch return error.OutOfMemory;
+                errdefer gpa.free(file_copy);
+                const snippet = if (m.hits.len > 0)
+                    std.fmt.allocPrint(gpa, "first hit @ 0x{x}", .{m.hits[0].offset}) catch return error.OutOfMemory
+                else
+                    gpa.dupe(u8, "") catch return error.OutOfMemory;
+                errdefer gpa.free(snippet);
+                const recommendation = gpa.dupe(u8, "Investigate matched bytes; tune rule or whitelist if benign.") catch return error.OutOfMemory;
+                yara_issues[i] = .{
+                    .rule_id = rule_id,
+                    .title = title,
+                    .severity = .medium,
+                    .source = .image_config,
+                    .file = file_copy,
+                    .line = 0,
+                    .snippet = snippet,
+                    .recommendation = recommendation,
+                };
+            }
+            const merged = try gpa.alloc(scribe.security.config.Issue, bom.config_issues.len + yara_issues.len);
+            @memcpy(merged[0..bom.config_issues.len], bom.config_issues);
+            @memcpy(merged[bom.config_issues.len..], yara_issues);
+            gpa.free(bom.config_issues);
+            gpa.free(yara_issues);
+            bom.config_issues = merged;
+        }
+    }
+
+    // Hardening + anomaly passes — only meaningful on a single binary
+    // target. Container sources iterate per-bundled-binary themselves;
+    // skip for now to avoid duplicating image_config issues.
     if (!scribe.container.isContainer(bytes)) {
         prog.step("checking exploit mitigations");
         if (scribe.parseFormat(gpa, bytes)) |fmt_info_const| {
@@ -1149,6 +1283,23 @@ fn runScan(
                         bom.config_issues = merged;
                     } else {
                         gpa.free(hard_issues);
+                    }
+                } else |_| {}
+            } else |_| {}
+            // Anti-tampering anomalies — separate analyzer over same parse.
+            if (scribe.security.anomalies.analyze(gpa, fmt_info, bytes)) |arep_const| {
+                var arep = arep_const;
+                defer arep.deinit(gpa);
+                if (scribe.security.anomalies.toConfigIssues(gpa, arep, target_path)) |anom_issues| {
+                    if (anom_issues.len > 0) {
+                        const merged = try gpa.alloc(scribe.security.config.Issue, bom.config_issues.len + anom_issues.len);
+                        @memcpy(merged[0..bom.config_issues.len], bom.config_issues);
+                        @memcpy(merged[bom.config_issues.len..], anom_issues);
+                        gpa.free(bom.config_issues);
+                        gpa.free(anom_issues);
+                        bom.config_issues = merged;
+                    } else {
+                        gpa.free(anom_issues);
                     }
                 } else |_| {}
             } else |_| {}

@@ -56,6 +56,12 @@ pub const HardeningReport = security.hardening.Report;
 pub const HardeningCheck = security.hardening.Check;
 pub const HardeningStatus = security.hardening.Status;
 pub const analyzeHardening = security.hardening.analyze;
+pub const YaraRuleSet = security.yara.RuleSet;
+pub const YaraMatch = security.yara.Match;
+pub const parseYara = security.yara.parse;
+pub const scanYara = security.yara.scan;
+pub const AnomalyReport = security.anomalies.Report;
+pub const analyzeAnomalies = security.anomalies.analyze;
 
 test {
     std.testing.refAllDecls(@This());

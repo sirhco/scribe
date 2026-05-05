@@ -12,6 +12,7 @@ Scribe is a high-performance, cross-platform binary forensics library and CLI wr
 - [CLI reference](#cli-reference)
   - [`scribe info`](#scribe-info-path) — format, arch, sections, hardening
   - [`scribe harden`](#scribe-harden-path) — exploit-mitigation report
+  - [`scribe yara`](#scribe-yara-path---rules-p) — YARA-subset rule matcher
   - [`scribe deps`](#scribe-deps-path) — dynamic dependencies
   - [`scribe strings`](#scribe-strings-path-min) — printable runs (SIMD)
   - [`scribe entropy`](#scribe-entropy-path) — Shannon entropy per section
@@ -198,6 +199,40 @@ $ scribe harden ./myapp --json | jq .checks[0]
 (severity `medium` for missing core protections, `low` for missing
 defense-in-depth, `info` for risky-but-on settings), so they flow
 through `scribe policy` and the TUI without bespoke wiring.
+
+### `scribe yara <path> --rules <p>`
+
+Matches a YARA-subset rule file against the target. Supported syntax:
+
+```yara
+rule example {
+  strings:
+    $literal = "hello"        // ASCII substring (modifiers: ascii / wide / nocase / fullword)
+    $hex     = { 4D 5A ?? ?? 50 45 }  // bytes + single-byte wildcards
+  condition:
+    any of them               // any/all/N of them, $a, and/or/not, ()
+}
+```
+
+Out of scope (errors at parse): jumps `[2-5]`, alternates `(AA|BB)`, regex
+`/.../`, `for`/`at`/`in`/`filesize`, module imports, `$*` set refs.
+
+```sh
+$ scribe yara /bin/zsh --rules rules.yar
+has_cstrings  6 hit(s)
+    $b @ 0x458c
+    $b @ 0xa45dc
+    $c @ 0x98a29
+```
+
+`scribe scan --yara <p>` folds rule matches into the same
+`config_issues[]` stream as IaC findings (severity `medium`), so they
+flow through `scribe policy` and the TUI.
+
+`scribe scan` also auto-runs an **anti-tampering** pass on every binary
+target (no flag needed): non-canonical ELF interpreter / Mach-O
+dylinker, entry point outside any `+X` section, process-injection
+symbol clusters. Findings appear under `BIN-ANOM-*` rule IDs.
 
 ### `scribe deps <path>`
 
